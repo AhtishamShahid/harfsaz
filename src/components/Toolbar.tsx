@@ -19,6 +19,7 @@ import { FONTS, FONT_STYLE_ORDER } from "../lib/font";
 import { LANGUAGES, languagePatch } from "../lib/languages";
 import { applyFormat, applyAlign } from "../editor/format";
 import { useUi } from "../lib/ui";
+import { applySelectionSize, captureSizeSelection, clearSelectionSizes, coversWholeEditor, selectionSizePx, type SizeSelection } from "../editor/selectionSize";
 
 const FONT_OPTIONS: SelectOption[] = FONT_STYLE_ORDER.flatMap((style) =>
   FONTS.filter((f) => f.style === style).map((f) => ({
@@ -54,7 +55,54 @@ export function Toolbar() {
     if (allPages) useDoc.getState().updatePageFrames(p);
     else if (sel) updateFrame(sel.page.id, sel.frame.id, p);
   };
-  const setSize = (n: number) => patch({ fontSize: Math.max(8, Math.min(400, n)) });
+  // Size follows the selected text: with words or lines selected in this frame,
+  // Size changes just them (and shows their size); otherwise the whole frame.
+  const sizeSelection = useRef<SizeSelection | null>(null);
+  const [selectionSize, setSelectionSize] = useState<number | null>(null);
+  useEffect(() => {
+    sizeSelection.current = null;
+    setSelectionSize(null);
+    const track = () => {
+      const target = captureSizeSelection();
+      if (target && target.host.dataset.frameId === f?.id) {
+        sizeSelection.current = target;
+        setSelectionSize(selectionSizePx(target));
+        return;
+      }
+      // A caret or a selection in another editor ends it; focus moving to the
+      // toolbar (e.g. typing in the Size box) keeps it.
+      const anchor = window.getSelection()?.anchorNode;
+      const el = anchor && (anchor.nodeType === Node.ELEMENT_NODE ? anchor as Element : anchor.parentElement);
+      if (el?.closest(".text-frame-edit")) {
+        sizeSelection.current = null;
+        setSelectionSize(null);
+      }
+    };
+    document.addEventListener("selectionchange", track);
+    return () => document.removeEventListener("selectionchange", track);
+  }, [f?.id]);
+  const shownSize = selectionSize ?? f?.fontSize ?? 32;
+  const setSize = (n: number) => {
+    const size = Math.max(8, Math.min(400, n));
+    const target = sizeSelection.current;
+    if (!allPages && target?.host.isConnected) {
+      if (!coversWholeEditor(target)) {
+        const next = applySelectionSize(target, size);
+        if (next) {
+          sizeSelection.current = next;
+          setSelectionSize(size);
+          return;
+        }
+      } else {
+        // The whole page is selected: size the frame, and drop per-word sizes
+        // so the page comes out uniform.
+        clearSelectionSizes(target.host);
+        target.host.dispatchEvent(new Event("harfsaz-format"));
+        setSelectionSize(size);
+      }
+    }
+    patch({ fontSize: size });
+  };
 
   // True when text is currently selected inside an editor — so format applies to
   // the selection (rich text). Otherwise we fall back to frame-level styling.
@@ -140,7 +188,7 @@ export function Toolbar() {
           <button
             disabled={dis}
             aria-label="Decrease font size"
-            onClick={() => setSize((f?.fontSize ?? 32) - 2)}
+            onClick={() => setSize(shownSize - 2)}
             className="flex h-full w-7 items-center justify-center rounded-l-lg text-ink-soft transition-colors hover:bg-paper-edge hover:text-ink disabled:opacity-45"
           >
             <Minus size={14} />
@@ -148,7 +196,7 @@ export function Toolbar() {
           <input
             type="number"
             aria-label="Font size"
-            value={f?.fontSize ?? 32}
+            value={shownSize}
             disabled={dis}
             onChange={(e) => setSize(Number(e.target.value) || 32)}
             className="h-full w-10 border-x border-line bg-transparent text-center text-[13px] font-semibold tabular-nums outline-none disabled:opacity-45 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
@@ -156,7 +204,7 @@ export function Toolbar() {
           <button
             disabled={dis}
             aria-label="Increase font size"
-            onClick={() => setSize((f?.fontSize ?? 32) + 2)}
+            onClick={() => setSize(shownSize + 2)}
             className="flex h-full w-7 items-center justify-center rounded-r-lg text-ink-soft transition-colors hover:bg-paper-edge hover:text-ink disabled:opacity-45"
           >
             <Plus size={14} />
