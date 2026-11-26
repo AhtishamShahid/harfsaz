@@ -28,10 +28,11 @@ fn layout_text(
     font_size: f32,
     frame_width: f32,
     align: Option<String>,
+    line_height: Option<f32>,
 ) -> Result<RenderLayout, String> {
     // "justify" triggers kashida elongation; other values just set line origin.
     let align = align.unwrap_or_else(|| "right".to_string());
-    shaping::layout_text(&text, &font_bytes, font_size, frame_width, &align)
+    shaping::layout_text(&text, &font_bytes, font_size, frame_width, &align, line_height)
 }
 
 /// Run an AI task (write / proofread / translate / layout) via Claude.

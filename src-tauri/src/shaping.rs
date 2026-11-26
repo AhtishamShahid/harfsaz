@@ -327,6 +327,7 @@ pub fn layout_text(
     font_size: f32,
     frame_width: f32,
     align: &str,
+    line_height_factor: Option<f32>,
 ) -> Result<RenderLayout, String> {
     let face = rustybuzz::Face::from_slice(font_bytes, 0)
         .ok_or_else(|| "Failed to parse font (not a valid ttf/otf)".to_string())?;
@@ -338,7 +339,9 @@ pub fn layout_text(
         return Err("Font reported invalid units-per-em".into());
     }
     let scale = font_size / units_per_em;
-    let line_height = font_size * 2.1; // generous leading for Nastaliq
+    // The frame's own line height (as the editor uses it), else generous
+    // Nastaliq leading.
+    let line_height = font_size * line_height_factor.filter(|f| *f > 0.0).unwrap_or(2.1);
     let pad = 10.0_f32; // inner padding matching the editor frame
 
     // Nastaliq glyphs ascend far above the baseline. Use the font's real ascender
@@ -388,7 +391,36 @@ pub fn layout_text(
             )?))
         };
 
+        let max_width = frame_width - pad * 2.0;
         for word in words {
+            // A word wider than the line (e.g. a long run with no spaces) is
+            // broken between letters, as the editor does, instead of running off
+            // the page on one line.
+            // Only words that could be that wide are checked (a letter is
+            // rarely wider than 1em), so ordinary words aren't shaped twice.
+            let mut pieces = if word.chars().count() as f32 * font_size > max_width {
+                split_long_word(word, &face, scale, max_width)
+            } else {
+                Vec::new()
+            };
+            if pieces.len() > 1 {
+                if !current.is_empty() {
+                    if let Some(l) = flush(&current, baseline, true)? {
+                        lines.push(l);
+                        baseline += line_height;
+                    }
+                    current.clear();
+                }
+                let last = pieces.pop().unwrap_or_default();
+                for piece in pieces {
+                    if let Some(l) = flush(&piece, baseline, false)? {
+                        lines.push(l);
+                        baseline += line_height;
+                    }
+                }
+                current = last;
+                continue;
+            }
             let candidate = if current.is_empty() {
                 word.to_string()
             } else {
@@ -421,6 +453,79 @@ pub fn layout_text(
         used_height,
         rtl: rtl_default,
     })
+}
+
+/// Zero-width joiner: keeps a letter in its joined form where a word is broken.
+const ZWJ: char = '\u{200D}';
+
+/// True for combining marks (harakat, Quranic marks, Latin diacritics) and
+/// joiners, which must stay with the letter before them.
+fn is_break_mark(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 |
+        0x06D6..=0x06DC | 0x06DF..=0x06E4 | 0x06E7..=0x06E8 | 0x06EA..=0x06ED |
+        0x200C | 0x200D)
+}
+
+/// Break a word wider than `max_width` into pieces that each fit, splitting
+/// between letters (never before a combining mark). Pieces are joined with ZWJ
+/// at the break so Nastaliq letters keep their connected shapes.
+fn split_long_word(word: &str, face: &rustybuzz::Face, scale: f32, max_width: f32) -> Vec<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let n = chars.len();
+    // Shape the whole word once and credit each glyph's advance to the letter
+    // it came from. Shaping long Nastaliq runs is slow (a fraction of a ms per
+    // letter), so breaks are found from these sums rather than by reshaping
+    // candidate pieces.
+    let mut char_of_byte = vec![0usize; word.len() + 1];
+    for (ci, (bi, _)) in word.char_indices().enumerate() { char_of_byte[bi] = ci; }
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(word);
+    buffer.guess_segment_properties();
+    let shaped = rustybuzz::shape(face, &[], buffer);
+    let mut advance = vec![0f32; n];
+    for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+        let ci = char_of_byte.get(info.cluster as usize).copied().unwrap_or(0);
+        advance[ci.min(n.saturating_sub(1))] += pos.x_advance as f32 * scale;
+    }
+
+    if advance.iter().sum::<f32>() <= max_width {
+        return vec![word.to_string()]; // fits as it is
+    }
+
+    // Move an index forward past combining marks so a break never lands before one.
+    let snap = |mut i: usize| { while i < n && is_break_mark(chars[i]) { i += 1; } i };
+    let piece = |start: usize, end: usize| {
+        let mut s = String::new();
+        if start > 0 { s.push(ZWJ); }
+        s.extend(&chars[start..end]);
+        if end < n { s.push(ZWJ); }
+        s
+    };
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < n {
+        // Always take at least one letter (with its marks).
+        let first = snap(start + 1);
+        let mut end = first;
+        let mut width: f32 = advance[start..end].iter().sum();
+        while end < n {
+            let next = snap(end + 1);
+            let w: f32 = advance[end..next].iter().sum();
+            if width + w > max_width { break; }
+            width += w;
+            end = next;
+        }
+        // Letters change shape at a break, so check the real piece once and
+        // give back a letter at a time if it came out too wide.
+        while end > first && measure(&piece(start, end), face, scale) > max_width {
+            end -= 1;
+            while end > first && is_break_mark(chars[end]) { end -= 1; }
+        }
+        pieces.push(piece(start, end));
+        start = end;
+    }
+    pieces
 }
 
 /// Measure the shaped width of a string in px.
@@ -718,4 +823,21 @@ mod tests {
         assert_eq!(stripped, line, "justification altered the underlying text");
     }
 
+
+    #[test]
+    fn long_word_without_spaces_wraps_inside_the_frame() {
+        let bytes = std::fs::read("../public/fonts/Gulzar-Regular.ttf").expect("font");
+        let word = "داسد".repeat(300); // no spaces, many lines wide
+        let layout = layout_text(&word, &bytes, 28.0, 714.0, "right", Some(1.7)).unwrap();
+        assert!(layout.lines.len() > 5, "expected many lines, got {}", layout.lines.len());
+        for line in &layout.lines {
+            assert!(line.width <= 714.0 - 20.0 + 0.5, "line {} wider than the frame", line.width);
+        }
+        // Every letter is kept (pieces only add joiners).
+        let letters: usize = layout.lines.iter().map(|l| l.glyphs.iter().filter(|g| !g.path.is_empty()).count()).sum();
+        assert!(letters >= word.chars().count() - 1, "lost letters: {letters}");
+        // Lines are spaced by the frame's line height.
+        let step = layout.lines[1].baseline_y - layout.lines[0].baseline_y;
+        assert!((step - 28.0 * 1.7).abs() < 0.01, "line step {step}");
+    }
 }

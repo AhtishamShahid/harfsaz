@@ -224,7 +224,7 @@ async function drawTextFrame(doc: jsPDF, frame: TextFrame): Promise<void> {
   let layout: RenderLayout;
   try {
     const font = await loadFontBytes(frame.fontKey);
-    layout = await layoutText(frame.text, font, frame.fontSize, frame.width, frame.align);
+    layout = await layoutText(frame.text, font, frame.fontSize, frame.width, frame.align, frame.lineHeight);
   } catch {
     return; // shaping failed for this frame — leave it blank rather than fail all
   }
