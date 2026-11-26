@@ -24,6 +24,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { useDoc, useSelectedFrame } from "./lib/store";
 import { useUi } from "./lib/ui";
 import { useShortcuts } from "./lib/shortcuts";
+import { useAllPagesSelection } from "./editor/allPagesSelection";
 
 export function App() {
   const share = !isTauri() ? new URLSearchParams(window.location.search).get("share") : null;
@@ -34,8 +35,10 @@ export function App() {
 function Editor() {
   const pages = useDoc((s) => s.pages);
   useShortcuts();
+  useAllPagesSelection();
 
   const aiOpen = useUi((s) => s.aiPanelOpen);
+  const allPages = useUi((s) => s.allPagesSelected);
   const objectBarOpen = useUi((s) => s.objectBarOpen);
   const toggleAi = useUi((s) => s.toggleAiPanel);
 
@@ -46,7 +49,7 @@ function Editor() {
 
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="editor-shell flex h-full flex-col" dir="ltr">
+      <div className={`editor-shell flex h-full flex-col${allPages ? " all-pages-selected" : ""}`} dir="ltr">
         <a href="#document-canvas" className="sr-only focus:not-sr-only">Skip to document</a>
         <MenuBar />
         <Toolbar />

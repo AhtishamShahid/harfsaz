@@ -117,6 +117,7 @@ export function MenuBar() {
           <MenuItem onSelect={exec("cut")} shortcut="⌘X">Cut</MenuItem>
           <MenuItem onSelect={exec("copy")} shortcut="⌘C">Copy</MenuItem>
           <MenuItem onSelect={exec("paste")} shortcut="⌘V">Paste</MenuItem>
+          <MenuItem onSelect={() => useUi.getState().setAllPagesSelected(true)} shortcut="⌘A ⌘A">Select all pages</MenuItem>
           <MenuSeparator />
           <MenuItem onSelect={() => useSearch.getState().setOpen(true)} shortcut="⌘F">
             Find &amp; replace…

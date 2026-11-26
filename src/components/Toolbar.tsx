@@ -18,6 +18,7 @@ import {
 import { FONTS, FONT_STYLE_ORDER } from "../lib/font";
 import { LANGUAGES, languagePatch } from "../lib/languages";
 import { applyFormat, applyAlign } from "../editor/format";
+import { useUi } from "../lib/ui";
 
 const FONT_OPTIONS: SelectOption[] = FONT_STYLE_ORDER.flatMap((style) =>
   FONTS.filter((f) => f.style === style).map((f) => ({
@@ -47,7 +48,12 @@ export function Toolbar() {
   const f = sel?.frame;
   const dis = !sel || (f?.kind !== undefined && f.kind !== "text");
 
-  const patch = (p: Partial<TextFrame>) => sel && updateFrame(sel.page.id, sel.frame.id, p);
+  // Select all pages (⌘A twice, or Edit ▸ Select all pages) → every page frame.
+  const allPages = useUi((s) => s.allPagesSelected);
+  const patch = (p: Partial<TextFrame>) => {
+    if (allPages) useDoc.getState().updatePageFrames(p);
+    else if (sel) updateFrame(sel.page.id, sel.frame.id, p);
+  };
   const setSize = (n: number) => patch({ fontSize: Math.max(8, Math.min(400, n)) });
 
   // True when text is currently selected inside an editor — so format applies to
@@ -62,7 +68,7 @@ export function Toolbar() {
     cmd: "bold" | "italic" | "underline",
     frameKey: "bold" | "italic" | "underline"
   ) => {
-    if (hasSelection() && applyFormat(cmd)) {
+    if (!allPages && hasSelection() && applyFormat(cmd)) {
       // re-emit handled by editor onInput; nothing else to do
     } else {
       patch({ [frameKey]: !f?.[frameKey] } as Partial<TextFrame>);
@@ -84,7 +90,7 @@ export function Toolbar() {
     return () => document.removeEventListener("selectionchange", track);
   }, [f?.id, f?.color]);
   const colorCmd = (value: string) => {
-    if (colorSelection.current) {
+    if (colorSelection.current && !allPages) {
       if (applySelectionColor(colorSelection.current, value)) setSelectedColor(value);
     }
     else patch({ color: value });
@@ -95,7 +101,7 @@ export function Toolbar() {
   // fall back to frame-level only when no editor is focused.
   const alignCmd = (a: TextFrame["align"]) => {
     const inEditor = !!document.activeElement?.closest?.(".text-frame-edit");
-    if (inEditor && applyAlign(a)) return;
+    if (!allPages && inEditor && applyAlign(a)) return;
     patch({ align: a });
   };
 

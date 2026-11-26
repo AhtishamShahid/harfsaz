@@ -115,6 +115,13 @@ interface DocState {
   ) => void;
   removeFrame: (pageId: string, frameId: string) => void;
   updateFrame: (pageId: string, frameId: string, patch: Partial<TextFrame>, checkpoint?: boolean) => void;
+  /** Apply a style patch to every page's main writing frame as ONE undo step
+   *  (whole-document formatting: Select all pages, then use the toolbar). */
+  updatePageFrames: (patch: Partial<TextFrame>) => void;
+  /** Delete the text of every page (Select all pages, then Backspace/Delete/Cut)
+   *  as ONE undo step. Pages that held only text are removed; pages with placed
+   *  objects (images, shapes, text boxes) stay with their main text emptied. */
+  clearAllPageText: () => void;
   /** Replace a frame's content programmatically (AI apply/insert). Sets text +
    *  rebuilds html, snapshots history, and bumps revision so a focused editor
    *  reseeds. `mode`: "replace" overwrites, "append" adds after existing text. */
@@ -449,6 +456,34 @@ export const useDoc = create<DocState>((set, get) => {
                 frames: p.frames.map((f) => (f.id === frameId ? { ...f, ...patch } : f)),
               }
         ),
+      };
+    }),
+
+  updatePageFrames: (patch) =>
+    set((s) => ({
+      ...snapshot(s),
+      pages: s.pages.map((p) => ({
+        ...p,
+        frames: p.frames.map((f) => (f.isPageFrame && (f.kind ?? "text") === "text" ? { ...f, ...patch } : f)),
+      })),
+    })),
+
+  clearAllPageText: () =>
+    set((s) => {
+      const isMain = (f: TextFrame) => !!f.isPageFrame && (f.kind ?? "text") === "text";
+      const kept = s.pages.filter((p, i) => i === 0 || p.frames.some((f) => !isMain(f)));
+      const first = kept[0].pageNumber;
+      const pages = kept.map((p, i) => ({
+        ...p,
+        pageNumber: p.pageNumber && first ? { ...p.pageNumber, value: first.value + i } : p.pageNumber,
+        frames: p.frames.map((f) => (isMain(f) ? { ...f, text: "", html: "" } : f)),
+      }));
+      return {
+        ...snapshot(s),
+        pages,
+        revision: s.revision + 1, // reseed the (focused) editors with the empty text
+        activePageId: pages[0].id,
+        selectedFrameId: pages[0].frames.find(isMain)?.id ?? s.selectedFrameId,
       };
     }),
 

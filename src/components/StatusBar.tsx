@@ -5,6 +5,7 @@ import { getLanguage } from "../lib/languages";
 
 /** Bottom status bar — word count, page navigation, zoom (InPage-style). */
 export function StatusBar() {
+  const allPages = useUi((s) => s.allPagesSelected);
   const pages = useDoc((s) => s.pages);
   const activePageId = useDoc((s) => s.activePageId);
   const activeIndex = Math.max(0, pages.findIndex((p) => p.id === activePageId));
@@ -37,6 +38,11 @@ export function StatusBar() {
   return (
     <footer className="editor-status flex shrink-0 items-center justify-between gap-4 overflow-x-auto whitespace-nowrap border-t border-line bg-paper px-4 py-1 text-[11px] text-ink-soft">
       <div className="flex items-center gap-4">
+        {allPages && (
+          <span role="status" className="font-medium text-accent">
+            All pages selected — font, size and spacing apply to every page · Esc to cancel
+          </span>
+        )}
         <SaveStatus
           dirty={dirty}
           saveError={saveError}

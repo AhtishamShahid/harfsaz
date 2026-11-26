@@ -1,6 +1,7 @@
 import { useWorkspace } from "./workspace";
 // Global keyboard shortcuts + auto-save. Mounted once from App.
 import { useEffect } from "react";
+import { deleteAllPagesText } from "../editor/allPagesSelection";
 import { useDoc } from "./store";
 import { useUi } from "./ui";
 import { useSearch } from "./search";
@@ -18,6 +19,21 @@ import {
 
 const AUTOSAVE_MS = 30_000;
 
+/** The main text editor of the page being worked on (selected frame's page, else the active page). */
+function currentPageEditor(): HTMLElement | null {
+  const doc = useDoc.getState();
+  const page = doc.getSelectedFrame()?.page ?? doc.pages.find((p) => p.id === doc.activePageId) ?? doc.pages[0];
+  const frame = page?.frames.find((f) => f.isPageFrame && (f.kind ?? "text") === "text");
+  return frame ? document.querySelector<HTMLElement>(`.text-frame-edit[data-frame-id="${CSS.escape(frame.id)}"]`) : null;
+}
+
+/** Whether the selection covers all of `editor`'s text. */
+function wholeEditorSelected(editor: HTMLElement): boolean {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.anchorNode || !editor.contains(sel.anchorNode) || !sel.focusNode || !editor.contains(sel.focusNode)) return false;
+  return sel.toString().replace(/\s/g, "") === (editor.textContent ?? "").replace(/\s/g, "");
+}
+
 /**
  * Wires application keyboard shortcuts (⌘/Ctrl based) and a periodic auto-save.
  *
@@ -34,6 +50,15 @@ export function useShortcuts() {
       if (useWorkspace.getState().view !== "editor") return;
       const doc = useDoc.getState();
       const ui = useUi.getState();
+
+      // Backspace/Delete with every page selected deletes all the text, like
+      // in a word processor (not just the current page's, or nothing).
+      const inField = !!(e.target as HTMLElement | null)?.closest?.("input, textarea, select");
+      if (ui.allPagesSelected && !inField && !e.metaKey && !e.ctrlKey && (e.key === "Backspace" || e.key === "Delete")) {
+        e.preventDefault();
+        deleteAllPagesText();
+        return;
+      }
 
       // Delete / Backspace removes the selected image/shape frame. We only block
       // it when the user is actively typing — i.e. focus is in an input/textarea,
@@ -57,10 +82,48 @@ export function useShortcuts() {
       }
 
       const mod = e.metaKey || e.ctrlKey;
-      if (!mod) return;
       const key = e.key.toLowerCase();
 
+      // Whole-document selection ends on Escape or on any key that would edit
+      // or move within the page (typing only ever affects the current page).
+      // Keys typed into toolbar fields (e.g. the Size box) must keep it, and so
+      // must ⌘C and ⌘X, which copy (and cut) every page while it is on.
+      const inDocument = !!(e.target as HTMLElement | null)?.closest?.("#document-canvas");
+      if (ui.allPagesSelected && (e.key === "Escape" || (inDocument && !(mod && (key === "a" || key === "c" || key === "x")) && !["shift", "meta", "control", "alt"].includes(key)))) {
+        ui.setAllPagesSelected(false);
+        if (e.key === "Escape") { e.preventDefault(); return; }
+      }
+
+      if (!mod) return;
+
       switch (key) {
+        case "a": {
+          // First ⌘A: the current page's text is selected. ⌘A again (whole page
+          // already selected): select ALL pages, so the toolbar's font, size,
+          // line height etc. apply to every page. This also works right after
+          // using the toolbar (e.g. the Size box), where focus has left the page.
+          const ae = document.activeElement as HTMLElement | null;
+          let editor = ae?.closest?.(".text-frame--page .text-frame-edit") as HTMLElement | null;
+          if (!editor) {
+            const field = ae?.closest?.("input, textarea, select, [contenteditable='true']") as HTMLElement | null;
+            const toolbarNumber = field instanceof HTMLInputElement && field.type === "number" && !field.closest("#document-canvas, [role='dialog']");
+            if (field && !toolbarNumber) break; // ⌘A inside a text field selects that field
+            editor = currentPageEditor();
+            if (!editor) break;
+          }
+          e.preventDefault();
+          if (ui.allPagesSelected || wholeEditorSelected(editor)) {
+            ui.setAllPagesSelected(true);
+          } else {
+            editor.focus({ preventScroll: true });
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            const sel = window.getSelection();
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+          }
+          break;
+        }
         case "f":
           // ⌘F opens find & replace. Handled here (capture phase) so it wins
           // over the webview's own find behaviour.
@@ -123,6 +186,17 @@ export function useShortcuts() {
     // (which would otherwise revert DOM text out of sync with our history).
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+
+  // Clicking anywhere in the document ends whole-document selection; toolbar
+  // and menu clicks (outside the canvas) keep it so formatting can be applied.
+  useEffect(() => {
+    const end = (e: PointerEvent) => {
+      if (!useUi.getState().allPagesSelected) return;
+      if ((e.target as HTMLElement | null)?.closest?.("#document-canvas")) useUi.getState().setAllPagesSelected(false);
+    };
+    window.addEventListener("pointerdown", end, true);
+    return () => window.removeEventListener("pointerdown", end, true);
   }, []);
 
   // Periodic auto-save (only writes when a file exists and there are changes).

@@ -8,6 +8,9 @@ interface UiState {
   zoom: number; // 0.25 – 2
   /** Editor view mode for the canvas (applies to all frames). */
   viewMode: "edit" | "preview";
+  /** Whole-document selection: toolbar formatting applies to every page. */
+  allPagesSelected: boolean;
+  setAllPagesSelected: (v: boolean) => void;
   /** Phonetic Roman→Urdu typing. */
   phonetic: boolean;
   /** Print dialog open. */
@@ -44,6 +47,8 @@ export const useUi = create<UiState>((set) => ({
   zoom: 1,
   viewMode: "edit",
   phonetic: true,
+  allPagesSelected: false,
+  setAllPagesSelected: (v) => set({ allPagesSelected: v }),
   printOpen: false,
   setPrintOpen: (v) => set({ printOpen: v }),
   keyboardHelpOpen: false,
