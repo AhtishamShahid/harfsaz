@@ -196,10 +196,17 @@ fn extract_legacy(raw: &[u8]) -> Vec<String> {
             pos += 4;
 
             if c0 == 0x00 && c1 == 0x00 {
-                // Skip header. If followed by 00 FF FF FF FF the stream is over;
-                // otherwise resync on the next marker.
+                // Zero length = end of a story. If followed by 00 FF FF FF FF the
+                // story list is over.
                 if pos + SKIP_TAIL.len() <= buf.len() && buf[pos..pos + SKIP_TAIL.len()] == SKIP_TAIL {
                     break 'outer;
+                }
+                // Otherwise the next story follows right after a single 0x00
+                // separator. Resyncing on the next marker here skipped that whole
+                // story — in real documents often the main body text.
+                if c2 == 0x00 && c3 == 0x00 && pos < buf.len() && buf[pos] == 0x00 {
+                    pos += 1;
+                    continue;
                 }
                 continue 'outer;
             }
@@ -311,6 +318,34 @@ mod tests {
         let mut ours = doc.paragraphs.join("\n");
         ours.push('\n'); // the reference terminates every record with a newline
         assert_eq!(ours, expected, "decoded text differs from the verified reference output");
+    }
+
+    /// One length-prefixed text record (paragraph) ending in 0x0D.
+    fn rec(body: &[u8]) -> Vec<u8> {
+        let mut r = ((body.len() + 1) as u32).to_le_bytes().to_vec();
+        r.extend_from_slice(body);
+        r.push(0x0D);
+        r
+    }
+
+    #[test]
+    fn reads_every_story_not_just_the_first_after_the_marker() {
+        // Real InPage 2.x streams hold several stories back to back. Each one is
+        // a run of records ended by a zero length plus one separator byte; the
+        // list ends with FF FF FF FF. The main text is often NOT the first story
+        // after the marker, so stopping/resyncing at a story end lost it.
+        let mut buf = vec![0x0D, 0, 0, 0, 0, 0]; // end of a previous story = marker
+        buf.extend(rec(&[])); // story A: one empty paragraph (header filler)
+        buf.extend(rec(&[]));
+        buf.extend([0, 0, 0, 0, 0]); // story end + separator
+        buf.extend(rec(&[0x04, 0x27, 0x04, 0x28])); // story B: the body text "اب"
+        buf.extend(rec(&[0x04, 0x28]));
+        buf.extend([0, 0, 0, 0, 0]);
+        buf.extend(rec(&[0x04, 0x27])); // story C: signature block
+        buf.extend([0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+
+        let paragraphs = extract_legacy(&buf);
+        assert_eq!(paragraphs, vec!["", "", "اب", "\u{0628}", "ا"]);
     }
 
     #[test]
