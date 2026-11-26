@@ -178,7 +178,9 @@ function paragraphHtml(p: StyledParagraph, from = 0, to = p.tokens.length): stri
     .map((x) => (x.bold ? `<span style="font-weight: 700;">${escapeHtml(x.text)}</span>` : escapeHtml(x.text)))
     .join("");
   const em = Math.round(p.em * 1000) / 1000;
-  return `<div data-harfsaz-style="body" style="font-size: ${em}em; line-height: inherit; margin-block-start: 0px; margin-block-end: 0px;">${inner || "<br>"}</div>`;
+  // A paragraph split across pages marks its later part, so text flow can join it again.
+  const cont = from > 0 ? ' data-harfsaz-cont=""' : "";
+  return `<div data-harfsaz-style="body"${cont} style="font-size: ${em}em; line-height: inherit; margin-block-start: 0px; margin-block-end: 0px;">${inner || "<br>"}</div>`;
 }
 
 /**

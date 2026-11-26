@@ -58,6 +58,10 @@ export interface TextFrame {
   borderColor: string;
   /** True for the main page-filling writing frame (seamless, no chrome). */
   isPageFrame?: boolean;
+  /** This page starts fresh, like after a page break: text flow never pulls
+   *  its text up into the previous page or pushes text into it. Set on pages
+   *  the user adds; pages without it continue the previous page's text. */
+  pageBreak?: boolean;
   /** Next frame id text overflows into (frame-linking — wired later). */
   linkedTo?: string;
 }
@@ -122,6 +126,11 @@ interface DocState {
    *  as ONE undo step. Pages that held only text are removed; pages with placed
    *  objects (images, shapes, text boxes) stay with their main text emptied. */
   clearAllPageText: () => void;
+  /** Write the result of a text-flow pass (editor/flow.ts): new contents for the
+   *  page frames it touched, pages it filled at the end and emptied pages it
+   *  removed. Not an undo step of its own (it belongs to the edit that caused
+   *  it) unless `checkpoint` is set, for an edit made directly in the DOM. */
+  applyFlow: (changes: { frameId: string; html: string; text: string }[], newPages: { afterPageId: string; html: string; text: string }[], removePageIds: string[], checkpoint?: boolean) => void;
   /** Replace a frame's content programmatically (AI apply/insert). Sets text +
    *  rebuilds html, snapshots history, and bumps revision so a focused editor
    *  reseeds. `mode`: "replace" overwrites, "append" adds after existing text. */
@@ -362,7 +371,7 @@ export const useDoc = create<DocState>((set, get) => {
         if (previous.pageNumber) p.pageNumber = { ...previous.pageNumber, value: previous.pageNumber.value + 1 };
         const main = previous.frames.find(f => f.isPageFrame);
         p.frames[0] = { ...p.frames[0], ...(main ? { fontKey: main.fontKey, fontSize: main.fontSize, lang: main.lang, dir: main.dir, align: main.align } : {}),
-          text: "", x: p.margin, y: p.margin, width: p.width - 2 * p.margin, height: p.height - 2 * p.margin };
+          text: "", x: p.margin, y: p.margin, width: p.width - 2 * p.margin, height: p.height - 2 * p.margin, pageBreak: true };
       }
       return {
         ...snapshot(s),
@@ -484,6 +493,45 @@ export const useDoc = create<DocState>((set, get) => {
         revision: s.revision + 1, // reseed the (focused) editors with the empty text
         activePageId: pages[0].id,
         selectedFrameId: pages[0].frames.find(isMain)?.id ?? s.selectedFrameId,
+      };
+    }),
+
+  applyFlow: (changes, newPages, removePageIds, checkpoint = false) =>
+    set((s) => {
+      const byFrame = new Map(changes.map((c) => [c.frameId, c]));
+      const removed = new Set(removePageIds);
+      const pages = s.pages
+        .filter((p) => !removed.has(p.id))
+        .map((p) => (p.frames.some((f) => byFrame.has(f.id))
+          ? { ...p, frames: p.frames.map((f) => { const c = byFrame.get(f.id); return c ? { ...f, html: c.html, text: c.text } : f; }) }
+          : p));
+      // A new page goes right after the page that overflowed (which need not be
+      // the last page) and takes its size, margins and text style.
+      // Several new pages after the same page go in order, each after the last.
+      const lastAdded = new Map<string, string>();
+      for (const content of newPages) {
+        const at = pages.findIndex((p) => p.id === (lastAdded.get(content.afterPageId) ?? content.afterPageId));
+        const previous = pages[at];
+        const main = previous?.frames.find((f) => f.isPageFrame && (f.kind ?? "text") === "text");
+        if (!previous || !main) continue;
+        const id = newId("page");
+        lastAdded.set(content.afterPageId, id);
+        pages.splice(at + 1, 0, {
+          id,
+          width: previous.width,
+          height: previous.height,
+          margin: previous.margin,
+          pageNumber: previous.pageNumber && { ...previous.pageNumber, value: previous.pageNumber.value + 1 },
+          frames: [{ ...main, id: newId("frame"), html: content.html, text: content.text, pageBreak: undefined }],
+        });
+      }
+      const alive = (id: string | null) => !!id && pages.some((p) => p.id === id || p.frames.some((f) => f.id === id));
+      return {
+        ...(checkpoint ? snapshot(s) : {}),
+        pages,
+        dirty: true,
+        activePageId: alive(s.activePageId) ? s.activePageId : pages[pages.length - 1].id,
+        selectedFrameId: alive(s.selectedFrameId) ? s.selectedFrameId : pages[pages.length - 1].frames[0]?.id ?? null,
       };
     }),
 

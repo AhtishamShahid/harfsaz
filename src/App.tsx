@@ -24,6 +24,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { useDoc, useSelectedFrame } from "./lib/store";
 import { useUi } from "./lib/ui";
 import { useShortcuts } from "./lib/shortcuts";
+import { usePageFlow } from "./editor/flow";
 import { useAllPagesSelection } from "./editor/allPagesSelection";
 
 export function App() {
@@ -35,6 +36,7 @@ export function App() {
 function Editor() {
   const pages = useDoc((s) => s.pages);
   useShortcuts();
+  usePageFlow();
   useAllPagesSelection();
 
   const aiOpen = useUi((s) => s.aiPanelOpen);
