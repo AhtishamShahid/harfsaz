@@ -25,6 +25,7 @@ export function PageSetupDialog() {
             <option value="794x1123">A4 portrait</option><option value="1123x794">A4 landscape</option>
             <option value="559x794">A5 portrait</option><option value="794x559">A5 landscape</option>
             <option value="816x1056">Letter portrait</option><option value="1056x816">Letter landscape</option>
+            <option value="816x1344">Legal portrait</option><option value="1344x816">Legal landscape</option>
           </select>
         </label>
         <label className="mt-4 flex flex-col gap-2 text-xs">Margins (mm)
