@@ -34,6 +34,31 @@ pub struct InpageDoc {
     /// True when the pre-3.0 record format was found and decoded (reliable).
     /// False when we fell back to the UTF-16 heuristic for newer files.
     pub legacy_format: bool,
+    /// The same text with character formatting, one entry per paragraph.
+    /// None when the formatting tables could not be read and verified.
+    pub styled: Option<Vec<Vec<InpageSpan>>>,
+    /// Page size and margins from the document setup, when found.
+    pub page: Option<InpagePage>,
+}
+
+/// A run of text sharing one character format.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct InpageSpan {
+    pub text: String,
+    pub bold: bool,
+    /// Font size in points (0 when the run does not set one).
+    pub size_pt: f32,
+}
+
+/// Page geometry in points. InPage stores lengths in 1/144000 inch.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct InpagePage {
+    pub width_pt: f32,
+    pub height_pt: f32,
+    pub margin_left_pt: f32,
+    pub margin_top_pt: f32,
+    pub margin_right_pt: f32,
+    pub margin_bottom_pt: f32,
 }
 
 const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -298,6 +323,186 @@ fn extract_utf16_runs(raw: &[u8]) -> Vec<String> {
     paragraphs
 }
 
+// ── Formatting (InPage 2.x) ─────────────────────────────────────────────────
+//
+// Reverse-engineered from real documents; every structure below is verified
+// before it is trusted, and any mismatch drops back to plain text.
+//
+// * Stories: a list of stories, each a run of `[u32 len][len bytes ending 0x0D]`
+//   paragraphs closed by a u32 0 and one 0x00 separator byte. The list ends with
+//   FF FF FF FF.
+// * Character runs follow immediately: `[u32 byte count][u32 size][size bytes]`.
+//   Counts are in story BYTES (an escaped script character counts 2) and cover
+//   every story in order, so their total must equal the stories' byte total —
+//   that equality is how we find (and verify) where the story list starts.
+//   A run body is `u16 kind, u32 len, tags…` where each tag is a u16 id and a
+//   u16 or u32 value. 0x7F00 = size (÷2000 = pt), 0x7F02 = weight (700 = bold).
+// * Page setup: tags 0x0106..0x010B in sequence — width, height, then margins
+//   (left, top, right, bottom), all in 1/144000 inch.
+
+const STORY_LIST_END: [u8; 10] = [0x0D, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+/// 1/144000 inch → points.
+const UNITS_PER_PT: f32 = 2000.0;
+
+fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
+    buf.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u16(buf: &[u8], at: usize) -> Option<u16> {
+    buf.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// Parse a story list starting at `p`. Returns the stories' paragraphs (each
+/// including its trailing 0x0D) and the offset just past FF FF FF FF.
+fn story_list(buf: &[u8], mut p: usize) -> Option<(Vec<&[u8]>, usize)> {
+    let mut paragraphs = Vec::new();
+    loop {
+        loop {
+            let n = read_u32(buf, p)? as usize;
+            p += 4;
+            if n == 0 {
+                break; // end of this story
+            }
+            if n > 0x10_0000 || p + n > buf.len() || buf[p + n - 1] != 0x0D {
+                return None;
+            }
+            paragraphs.push(&buf[p..p + n]);
+            p += n;
+        }
+        if *buf.get(p)? != 0x00 {
+            return None;
+        }
+        p += 1;
+        if read_u32(buf, p)? == u32::MAX {
+            return Some((paragraphs, p + 4));
+        }
+    }
+}
+
+struct CharRun {
+    bytes: usize,
+    bold: bool,
+    size_pt: f32,
+}
+
+/// Parse one run's tag list; None unless the tags consume it exactly.
+fn run_format(body: &[u8]) -> Option<(bool, f32)> {
+    let inner_len = read_u32(body, 2)? as usize;
+    let inner = body.get(6..)?;
+    if inner.len() != inner_len {
+        return None;
+    }
+    let (mut bold, mut size) = (false, 0.0);
+    let mut q = 0;
+    while q < inner.len() {
+        let tag = read_u16(inner, q)?;
+        q += 2;
+        let wide = matches!(tag, 0x0080 | 0x7F00 | 0x7F05 | 0x7F06);
+        let value = if wide { read_u32(inner, q)? } else { read_u16(inner, q)? as u32 };
+        q += if wide { 4 } else { 2 };
+        match tag {
+            0x7F00 => size = value as f32 / UNITS_PER_PT,
+            0x7F02 => bold = value >= 600,
+            _ => {}
+        }
+    }
+    (q == inner.len()).then_some((bold, size))
+}
+
+/// The character-run table at `p`. Empty if the first run does not parse.
+fn char_runs(buf: &[u8], mut p: usize) -> Vec<CharRun> {
+    let mut runs = Vec::new();
+    while let (Some(count), Some(size)) = (read_u32(buf, p), read_u32(buf, p + 4)) {
+        let (count, size) = (count as usize, size as usize);
+        if count > 0x10_0000 || size < 6 || size > 0x400 {
+            break;
+        }
+        let Some(body) = buf.get(p + 8..p + 8 + size) else { break };
+        let Some((bold, size_pt)) = run_format(body) else { break };
+        runs.push(CharRun { bytes: count, bold, size_pt });
+        p += 8 + size;
+    }
+    runs
+}
+
+/// Paragraphs with character formatting, or None if anything fails to verify.
+fn extract_formatted(buf: &[u8]) -> Option<Vec<Vec<InpageSpan>>> {
+    let end = find(buf, 0, &STORY_LIST_END)? + STORY_LIST_END.len();
+    let runs = char_runs(buf, end);
+    let total: usize = runs.iter().map(|r| r.bytes).sum();
+    if runs.is_empty() || total == 0 {
+        return None;
+    }
+    // The first offset whose story list ends exactly where the runs begin and
+    // whose byte total matches theirs is the start of the stories.
+    let paragraphs = (0..end).find_map(|p| {
+        if read_u32(buf, p)? == 0 {
+            return None;
+        }
+        let (paras, stop) = story_list(buf, p)?;
+        let bytes: usize = paras.iter().map(|x| x.len()).sum();
+        (stop == end && bytes == total).then_some(paras)
+    })?;
+
+    let mut out = Vec::with_capacity(paragraphs.len());
+    let (mut run, mut left) = (0usize, runs[0].bytes);
+    for para in paragraphs {
+        let mut spans: Vec<InpageSpan> = Vec::new();
+        let mut i = 0;
+        while i < para.len() {
+            while left == 0 && run + 1 < runs.len() {
+                run += 1;
+                left = runs[run].bytes;
+            }
+            let (chr, used) = decode_char(para, i);
+            let r = &runs[run];
+            // The trailing 0x0D is the paragraph break, not text.
+            if let Some(c) = chr.filter(|_| i + used < para.len()) {
+                match spans.last_mut() {
+                    Some(s) if s.bold == r.bold && s.size_pt == r.size_pt => s.text.push(c),
+                    _ => spans.push(InpageSpan { text: c.to_string(), bold: r.bold, size_pt: r.size_pt }),
+                }
+            }
+            left = left.saturating_sub(used);
+            i += used;
+        }
+        // Same correction as the plain text, across span boundaries (ے and the
+        // next letter can sit in different formatting runs). It swaps one char
+        // for one char, so each span keeps its length.
+        let mut chars: Vec<char> = spans.iter().flat_map(|s| s.text.chars()).collect();
+        fix_bari_ye(&mut chars);
+        let mut rest = chars.into_iter();
+        for span in &mut spans {
+            let n = span.text.chars().count();
+            span.text = rest.by_ref().take(n).collect();
+        }
+        out.push(spans);
+    }
+    Some(out)
+}
+
+/// Page size and margins from the document setup tags, if present and sane.
+fn page_setup(buf: &[u8]) -> Option<InpagePage> {
+    let at = (0..buf.len().saturating_sub(36)).find(|&i| {
+        (0..6).all(|k| buf[i + 6 * k] == 0x06 + k as u8 && buf[i + 6 * k + 1] == 0x01)
+    })?;
+    let v: Vec<f32> = (0..6)
+        .map(|k| read_u32(buf, at + 6 * k + 2).map(|x| x as f32 / UNITS_PER_PT))
+        .collect::<Option<_>>()?;
+    let sane = (72.0..=3000.0).contains(&v[0])
+        && (72.0..=3000.0).contains(&v[1])
+        && v[2] + v[4] < v[0]
+        && v[3] + v[5] < v[1];
+    sane.then(|| InpagePage {
+        width_pt: v[0],
+        height_pt: v[1],
+        margin_left_pt: v[2],
+        margin_top_pt: v[3],
+        margin_right_pt: v[4],
+        margin_bottom_pt: v[5],
+    })
+}
+
 /// Extract the text of an InPage file.
 pub fn extract_text(bytes: &[u8]) -> Result<InpageDoc, String> {
     if !is_inpage(bytes) {
@@ -305,7 +510,13 @@ pub fn extract_text(bytes: &[u8]) -> Result<InpageDoc, String> {
     }
     let legacy = extract_legacy(bytes);
     if !legacy.is_empty() {
-        return Ok(InpageDoc { paragraphs: legacy, legacy_format: true });
+        let buf = strip_pattern(bytes, &separator());
+        return Ok(InpageDoc {
+            paragraphs: legacy,
+            legacy_format: true,
+            styled: extract_formatted(&buf),
+            page: page_setup(&buf),
+        });
     }
     let modern = extract_utf16_runs(bytes);
     if modern.is_empty() {
@@ -316,7 +527,7 @@ pub fn extract_text(bytes: &[u8]) -> Result<InpageDoc, String> {
                 .into(),
         );
     }
-    Ok(InpageDoc { paragraphs: modern, legacy_format: false })
+    Ok(InpageDoc { paragraphs: modern, legacy_format: false, styled: None, page: None })
 }
 
 #[cfg(test)]
@@ -375,6 +586,70 @@ mod tests {
 
         let paragraphs = extract_legacy(&buf);
         assert_eq!(paragraphs, vec!["", "", "اب", "\u{0628}", "ا"]);
+    }
+
+    /// A character run: byte count, then `kind, len, tags` with size and weight.
+    fn run(bytes: u32, size_pt: u32, weight: u16) -> Vec<u8> {
+        let mut tags = vec![0x80, 0x00, 0, 0, 0, 0]; // 0x0080 = 0 (u32)
+        tags.extend([0x00, 0x7F]);
+        tags.extend((size_pt * 2000).to_le_bytes());
+        tags.extend([0x02, 0x7F]);
+        tags.extend(weight.to_le_bytes());
+        let mut body = vec![0x01, 0x00];
+        body.extend((tags.len() as u32).to_le_bytes());
+        body.extend(tags);
+        let mut r = bytes.to_le_bytes().to_vec();
+        r.extend((body.len() as u32).to_le_bytes());
+        r.extend(body);
+        r
+    }
+
+    /// Filler, then a bold 30pt title story ("اب") and a regular 15pt story ("ا").
+    fn formatted_doc(second_run_bytes: u32) -> Vec<u8> {
+        let mut buf = vec![0x07; 40]; // stands in for the style/font tables
+        buf.extend(rec(&[0x04, 0x27, 0x04, 0x28])); // 4 + 5 bytes
+        buf.extend([0, 0, 0, 0, 0]);
+        buf.extend(rec(&[0x04, 0x27])); // 4 + 3 bytes
+        buf.extend([0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        buf.extend(run(5, 30, 700));
+        buf.extend(run(second_run_bytes, 15, 400));
+        buf
+    }
+
+    #[test]
+    fn reads_bold_and_size_from_the_character_runs() {
+        let span = |text: &str, bold, size_pt| InpageSpan { text: text.into(), bold, size_pt };
+        assert_eq!(
+            extract_formatted(&formatted_doc(3)),
+            Some(vec![vec![span("اب", true, 30.0)], vec![span("ا", false, 15.0)]])
+        );
+    }
+
+    #[test]
+    fn falls_back_to_plain_text_when_runs_do_not_cover_the_stories() {
+        // Runs covering 5 + 2 bytes cannot belong to stories of 5 + 3 bytes.
+        assert_eq!(extract_formatted(&formatted_doc(2)), None);
+    }
+
+    #[test]
+    fn reads_page_size_and_margins() {
+        let mut buf = vec![0u8; 8];
+        for (k, inches) in [8.5f32, 14.0, 0.5, 4.0, 0.5, 0.5].iter().enumerate() {
+            buf.extend([0x06 + k as u8, 0x01]);
+            buf.extend(((inches * 144000.0) as u32).to_le_bytes());
+        }
+        buf.extend([0u8; 8]);
+        assert_eq!(
+            page_setup(&buf),
+            Some(InpagePage {
+                width_pt: 612.0,
+                height_pt: 1008.0,
+                margin_left_pt: 36.0,
+                margin_top_pt: 288.0,
+                margin_right_pt: 36.0,
+                margin_bottom_pt: 36.0,
+            })
+        );
     }
 
     #[test]

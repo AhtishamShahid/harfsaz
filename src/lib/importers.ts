@@ -8,7 +8,9 @@
 import { open as openDialog, message } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { useDoc, DocFile, Page, TextFrame } from "./store";
-import { isTauri, importInpage } from "./tauri";
+import { isTauri, importInpage, type InpageDoc, type InpageSpan } from "./tauri";
+import { ensureFontFace, getFont } from "./font";
+import { escapeHtml } from "../editor/sanitize";
 import { importPdfBytes } from "./importPdf";
 import { pickFile } from "./download";
 
@@ -119,6 +121,171 @@ function load(pages: Page[], name: string) {
 
 // ── InPage ──────────────────────────────────────────────────────────────────
 
+// Gulzar is a Lahori-style Nastaliq like InPage's Noori Nastaliq, so it keeps
+// InPage documents compact. InPage itself uses 130% leading; Gulzar needs a
+// little more (1.5) before tall letters touch the line below.
+const INPAGE_FONT = "gulzar";
+const INPAGE_LINE_HEIGHT = 1.5;
+const PX_PER_PT = 96 / 72;
+
+/** A word with its trailing space; bold can change inside a word. */
+type Token = { text: string; bold: boolean }[];
+interface StyledParagraph {
+  tokens: Token[];
+  /** Font size relative to the frame's base size (1 = base). */
+  em: number;
+}
+
+/** Most common point size by character count; 0 when none is set. */
+function dominantSize(spans: InpageSpan[]): number {
+  const weight = new Map<number, number>();
+  for (const s of spans) if (s.size_pt > 0) weight.set(s.size_pt, (weight.get(s.size_pt) ?? 0) + s.text.length);
+  let best = 0;
+  let most = -1;
+  for (const [size, n] of weight) if (n > most) [best, most] = [size, n];
+  return best;
+}
+
+/** Split a paragraph into whole words, even where bold changes mid-word, so a
+ *  page break can never fall inside a word. */
+function wordTokens(spans: InpageSpan[]): Token[] {
+  const chars = spans.flatMap((s) => Array.from(s.text, (c) => ({ c, bold: s.bold })));
+  const text = chars.map((x) => x.c).join("");
+  const tokens: Token[] = [];
+  let at = 0;
+  for (const word of text.match(/\S+\s*|\s+/g) ?? []) {
+    const n = Array.from(word).length;
+    const token: Token = [];
+    for (const { c, bold } of chars.slice(at, at + n)) {
+      const last = token[token.length - 1];
+      if (last && last.bold === bold) last.text += c;
+      else token.push({ text: c, bold });
+    }
+    tokens.push(token);
+    at += n;
+  }
+  return tokens;
+}
+
+function paragraphHtml(p: StyledParagraph, from = 0, to = p.tokens.length): string {
+  const parts: { text: string; bold: boolean }[] = [];
+  for (const segment of p.tokens.slice(from, to).flat()) {
+    const last = parts[parts.length - 1];
+    if (last && last.bold === segment.bold) last.text += segment.text;
+    else parts.push({ ...segment });
+  }
+  const inner = parts
+    .map((x) => (x.bold ? `<span style="font-weight: 700;">${escapeHtml(x.text)}</span>` : escapeHtml(x.text)))
+    .join("");
+  const em = Math.round(p.em * 1000) / 1000;
+  return `<div data-harfsaz-style="body" style="font-size: ${em}em; line-height: inherit; margin-block-start: 0px; margin-block-end: 0px;">${inner || "<br>"}</div>`;
+}
+
+/**
+ * Lay an InPage document out on its own page size, keeping bold and paragraph
+ * sizes. Pages are filled by MEASURING the text in a hidden copy of the page
+ * frame (same width, font, size and leading), so they break where the editor
+ * will actually wrap instead of by a character-count guess.
+ */
+async function formattedInpagePages(doc: InpageDoc): Promise<Page[] | null> {
+  const page = doc.page!;
+  const styled = doc.styled!;
+  const base = dominantSize(styled.flat()) || 15;
+  const fontSize = Math.round(base * PX_PER_PT);
+  const width = Math.round(page.width_pt * PX_PER_PT);
+  const height = Math.round(page.height_pt * PX_PER_PT);
+  const frameX = Math.round(page.margin_left_pt * PX_PER_PT);
+  const frameY = Math.round(page.margin_top_pt * PX_PER_PT);
+  const frameW = width - frameX - Math.round(page.margin_right_pt * PX_PER_PT);
+  const frameH = height - frameY - Math.round(page.margin_bottom_pt * PX_PER_PT);
+  if (frameW < 100 || frameH < 100) return null;
+
+  const paragraphs: StyledParagraph[] = styled.map((spans) => ({
+    em: (dominantSize(spans) || base) / base,
+    tokens: wordTokens(spans),
+  }));
+
+  try {
+    await ensureFontFace(INPAGE_FONT);
+    await (document as Document & { fonts: FontFaceSet }).fonts.ready;
+  } catch {
+    return null; // without the real font, measurement would be meaningless
+  }
+
+  // Mirror the editor: .text-frame-edit content styled like TextFrameView's textStyle.
+  const probe = document.createElement("div");
+  probe.className = "text-frame-edit";
+  probe.dir = "rtl";
+  Object.assign(probe.style, {
+    position: "absolute", left: "-100000px", top: "0", visibility: "hidden",
+    width: `${frameW}px`, fontSize: `${fontSize}px`, lineHeight: String(INPAGE_LINE_HEIGHT), textAlign: "right",
+    fontFamily: `"${getFont(INPAGE_FONT).cssFamily}", serif`, paddingTop: "6px",
+  });
+  document.body.appendChild(probe);
+  // The editor is pulled up by ~0.32em and pads 6px, and clips its content at
+  // the frame's height measured from its own top (see editor/flow.ts).
+  const limit = frameH;
+  const fits = (html: string) => {
+    probe.innerHTML = html;
+    return probe.scrollHeight <= limit;
+  };
+
+  const pagesHtml: string[] = [];
+  let current = "";
+  try {
+    for (const p of paragraphs) {
+      let from = 0;
+      while (from < p.tokens.length || (from === 0 && p.tokens.length === 0)) {
+        const whole = paragraphHtml(p, from);
+        if (fits(current + whole)) {
+          current += whole;
+          break;
+        }
+        // Largest number of words from `from` that still fits on this page.
+        let lo = from, hi = p.tokens.length;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          if (fits(current + paragraphHtml(p, from, mid))) lo = mid;
+          else hi = mid - 1;
+        }
+        if (lo > from) {
+          current += paragraphHtml(p, from, lo);
+          from = lo;
+        } else if (!current) {
+          // A single word taller/wider than the page: place it anyway.
+          current = paragraphHtml(p, from, from + 1);
+          from += 1;
+        }
+        pagesHtml.push(current);
+        current = "";
+      }
+    }
+    if (current || pagesHtml.length === 0) pagesHtml.push(current);
+  } finally {
+    probe.remove();
+  }
+
+  return pagesHtml.map((html) => {
+    // One line per paragraph block, entities decoded (escapeHtml only emits these three).
+    const text = html.replace(/<\/div>/g, "\n").replace(/<[^>]+>/g, "").replace(/\n$/, "")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    return {
+      id: nid("page"),
+      width,
+      height,
+      frames: [{
+        ...pageFrame(text, "ur", INPAGE_FONT, fontSize),
+        x: frameX,
+        y: frameY,
+        width: frameW,
+        height: frameH,
+        html,
+        lineHeight: INPAGE_LINE_HEIGHT,
+      }],
+    };
+  });
+}
+
 /** Import an InPage .inp file into a new document. */
 export async function importInpageDocument(): Promise<boolean> {
   if (!isTauri()) {
@@ -133,7 +300,7 @@ export async function importInpageDocument(): Promise<boolean> {
   });
   if (!picked || Array.isArray(picked)) return false;
 
-  let result: { paragraphs: string[]; legacy_format: boolean };
+  let result: InpageDoc;
   try {
     result = await importInpage(picked);
   } catch (e) {
@@ -141,22 +308,29 @@ export async function importInpageDocument(): Promise<boolean> {
     return false;
   }
 
-  const fontSize = 28;
-  const texts = paginate(result.paragraphs, fontSize);
-  const pages: Page[] = texts.map((t) => ({
-    id: nid("page"),
-    width: A4.width,
-    height: A4.height,
-    frames: [pageFrame(t, "ur", "noto-nastaliq", fontSize)],
-  }));
+  const formatted = result.styled && result.page ? await formattedInpagePages(result) : null;
+  let pages: Page[];
+  if (formatted) {
+    pages = formatted;
+  } else {
+    const fontSize = 28;
+    pages = paginate(result.paragraphs, fontSize).map((t) => ({
+      id: nid("page"),
+      width: A4.width,
+      height: A4.height,
+      frames: [pageFrame(t, "ur", INPAGE_FONT, fontSize)],
+    }));
+  }
   load(pages, baseName(picked));
 
   const words = result.paragraphs.join(" ").split(/\s+/).filter(Boolean).length;
   await message(
     `Imported ${result.paragraphs.length} paragraphs (${words.toLocaleString()} words) onto ${pages.length} pages.\n\n` +
-      (result.legacy_format
-        ? "Text was recovered from the InPage record format. Fonts, frames and page layout are not stored in a readable form and were not imported — the text has been paginated onto A4 pages."
-        : "This file uses the newer InPage format, which can only be read heuristically; check the text carefully for missing passages."),
+      (formatted
+        ? "Page size, margins, bold and paragraph font sizes were imported from the InPage file. Fonts, borders, text boxes and images are not imported yet, and mixed sizes within one line use the paragraph's main size."
+        : result.legacy_format
+          ? "Text was recovered from the InPage record format. Fonts, frames and page layout are not stored in a readable form and were not imported — the text has been paginated onto A4 pages."
+          : "This file uses the newer InPage format, which can only be read heuristically; check the text carefully for missing passages."),
     { title: "InPage import", kind: "info" }
   );
   return true;

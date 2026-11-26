@@ -255,6 +255,26 @@ export interface InpageDoc {
   paragraphs: string[];
   /** True when the reliable pre-3.0 record format was decoded. */
   legacy_format: boolean;
+  /** The paragraphs again with character formatting, when it could be verified. */
+  styled: InpageSpan[][] | null;
+  /** Page size and margins in points, when the document setup was found. */
+  page: InpagePage | null;
+}
+
+export interface InpageSpan {
+  text: string;
+  bold: boolean;
+  /** Point size; 0 when the run sets none. */
+  size_pt: number;
+}
+
+export interface InpagePage {
+  width_pt: number;
+  height_pt: number;
+  margin_left_pt: number;
+  margin_top_pt: number;
+  margin_right_pt: number;
+  margin_bottom_pt: number;
 }
 
 /** Extract the text of an InPage file (read on the Rust side by path). */
