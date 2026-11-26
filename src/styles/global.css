@@ -411,14 +411,16 @@ button.workspace-primary{background:var(--accent);color:#fff;border:1px solid va
 
 /* Select all pages: every page's text is painted like a selection
    (editor/allPagesSelection.ts). Older engines without ::highlight get a tint. */
-::highlight(harfsaz-all-pages) { background-color: Highlight; color: inherit; }
+::highlight(harfsaz-all-pages), ::highlight(harfsaz-cross-page) { background-color: Highlight; color: inherit; }
 /* The current page also holds a real selection; hide it so that page is not doubly highlighted. */
 .all-pages-selected .text-frame--page .text-frame-edit::selection,
-.all-pages-selected .text-frame--page .text-frame-edit *::selection { background: transparent; }
+.all-pages-selected .text-frame--page .text-frame-edit *::selection,
+body.harfsaz-cross-selecting .text-frame--page .text-frame-edit::selection,
+body.harfsaz-cross-selecting .text-frame--page .text-frame-edit *::selection { background: transparent; }
 @supports not selector(::highlight(x)) {
   .all-pages-selected .text-frame--page .text-frame-edit {
     background: color-mix(in srgb, Highlight 45%, transparent);
   }
 }
 body.harfsaz-exporting .all-pages-selected .text-frame--page .text-frame-edit { background: none; }
-body.harfsaz-exporting *::highlight(harfsaz-all-pages) { background-color: transparent; }
+body.harfsaz-exporting *::highlight(harfsaz-all-pages), body.harfsaz-exporting *::highlight(harfsaz-cross-page) { background-color: transparent; }

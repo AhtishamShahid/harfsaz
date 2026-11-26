@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { aiTransform, TransformAction } from "../lib/tauri";
 import { installSelectionMenuEvents } from "./selectionMenuEvents";
 import { useUi } from "../lib/ui";
+import { isCrossPageSelectionActive } from "./crossPageSelection";
 
 type Anchor = { x: number; y: number };
 
@@ -66,7 +67,8 @@ export function SelectionMenu() {
       capture: captureSelection,
       card: () => cardRef.current,
       close: () => setSel(null),
-      enabled: () => useUi.getState().selectionAi,
+      // Not for a selection across pages (the AI menu works on one page's text).
+      enabled: () => useUi.getState().selectionAi && !isCrossPageSelectionActive(),
       open: (captured, contextEvent) => {
         setSel(contextEvent ? { ...captured, anchor: { x: contextEvent.clientX, y: contextEvent.clientY } } : captured);
         setResult(null);

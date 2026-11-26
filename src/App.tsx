@@ -26,6 +26,7 @@ import { useUi } from "./lib/ui";
 import { useShortcuts } from "./lib/shortcuts";
 import { usePageFlow } from "./editor/flow";
 import { useAllPagesSelection } from "./editor/allPagesSelection";
+import { useCrossPageSelection } from "./editor/crossPageSelection";
 
 export function App() {
   const share = !isTauri() ? new URLSearchParams(window.location.search).get("share") : null;
@@ -38,6 +39,7 @@ function Editor() {
   useShortcuts();
   usePageFlow();
   useAllPagesSelection();
+  useCrossPageSelection();
 
   const aiOpen = useUi((s) => s.aiPanelOpen);
   const allPages = useUi((s) => s.allPagesSelected);

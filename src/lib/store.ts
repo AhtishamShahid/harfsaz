@@ -122,6 +122,9 @@ interface DocState {
   /** Apply a style patch to every page's main writing frame as ONE undo step
    *  (whole-document formatting: Select all pages, then use the toolbar). */
   updatePageFrames: (patch: Partial<TextFrame>) => void;
+  /** Run `fn` (synchronous edits, e.g. formatting several page editors) as ONE
+   *  undo step. */
+  batch: (fn: () => void) => void;
   /** Delete the text of every page (Select all pages, then Backspace/Delete/Cut)
    *  as ONE undo step. Pages that held only text are removed; pages with placed
    *  objects (images, shapes, text boxes) stay with their main text emptied. */
@@ -325,10 +328,13 @@ function samePages(a: Page[], b: Page[]): boolean {
   }
 }
 
+/** While true, edits join the undo step `batch` opened instead of adding their own. */
+let batching = false;
+
 export const useDoc = create<DocState>((set, get) => {
   // Push the current pages onto the undo stack and mark dirty. Call BEFORE a
   // mutation.
-  const snapshot = (s: DocState): Partial<DocState> => ({
+  const snapshot = (s: DocState): Partial<DocState> => (batching ? { dirty: true } : {
     past: [...s.past, s.pages].slice(-HISTORY_LIMIT),
     future: [],
     dirty: true,
@@ -476,6 +482,17 @@ export const useDoc = create<DocState>((set, get) => {
         frames: p.frames.map((f) => (f.isPageFrame && (f.kind ?? "text") === "text" ? { ...f, ...patch } : f)),
       })),
     })),
+
+  batch: (fn) => {
+    if (batching) return fn();
+    set((s) => snapshot(s));
+    batching = true;
+    try {
+      fn();
+    } finally {
+      batching = false;
+    }
+  },
 
   clearAllPageText: () =>
     set((s) => {

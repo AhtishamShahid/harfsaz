@@ -19,6 +19,7 @@ import { FONTS, FONT_STYLE_ORDER } from "../lib/font";
 import { LANGUAGES, languagePatch } from "../lib/languages";
 import { applyFormat, applyAlign } from "../editor/format";
 import { useUi } from "../lib/ui";
+import { isCrossPageSelectionActive, formatCrossSelection, colorCrossSelection, sizeCrossSelection } from "../editor/crossPageSelection";
 import { applySelectionSize, captureSizeSelection, clearSelectionSizes, coversWholeEditor, selectionSizePx, type SizeSelection } from "../editor/selectionSize";
 
 const FONT_OPTIONS: SelectOption[] = FONT_STYLE_ORDER.flatMap((style) =>
@@ -84,6 +85,11 @@ export function Toolbar() {
   const shownSize = selectionSize ?? f?.fontSize ?? 32;
   const setSize = (n: number) => {
     const size = Math.max(8, Math.min(400, n));
+    if (!allPages && isCrossPageSelectionActive()) {
+      sizeCrossSelection(size); // text selected across pages
+      setSelectionSize(size);
+      return;
+    }
     const target = sizeSelection.current;
     if (!allPages && target?.host.isConnected) {
       if (!coversWholeEditor(target)) {
@@ -116,7 +122,9 @@ export function Toolbar() {
     cmd: "bold" | "italic" | "underline",
     frameKey: "bold" | "italic" | "underline"
   ) => {
-    if (!allPages && hasSelection() && applyFormat(cmd)) {
+    if (!allPages && isCrossPageSelectionActive()) {
+      formatCrossSelection(cmd); // text selected across pages
+    } else if (!allPages && hasSelection() && applyFormat(cmd)) {
       // re-emit handled by editor onInput; nothing else to do
     } else {
       patch({ [frameKey]: !f?.[frameKey] } as Partial<TextFrame>);
@@ -138,6 +146,11 @@ export function Toolbar() {
     return () => document.removeEventListener("selectionchange", track);
   }, [f?.id, f?.color]);
   const colorCmd = (value: string) => {
+    if (!allPages && isCrossPageSelectionActive()) {
+      colorCrossSelection(value); // text selected across pages
+      colorSelection.current = null;
+      return;
+    }
     if (colorSelection.current && !allPages) {
       if (applySelectionColor(colorSelection.current, value)) setSelectedColor(value);
     }
