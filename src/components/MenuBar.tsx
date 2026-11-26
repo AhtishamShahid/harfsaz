@@ -191,11 +191,35 @@ export function MenuBar() {
 
         <WebAccount />
 
+        <SelectionAiSwitch />
+
         <Button variant="ghost" size="sm" className="gap-1.5" aria-expanded={aiOpen} onClick={toggleAi}>
           <Sparkles size={14} /> Assistant
         </Button>
         <Button variant="primary" size="sm" onClick={() => setPrintOpen(true)}>Export / Print</Button>
       </div>
     </header>
+  );
+}
+
+/** Header switch for the AI menu that opens on selected (e.g. double-clicked) text. */
+function SelectionAiSwitch() {
+  const on = useUi((s) => s.selectionAi);
+  const setOn = useUi((s) => s.setSelectionAi);
+  return (
+    <IconTip label={on ? "AI menu opens when you select or double-click text. Click to turn off." : "AI menu on selected text is off. Click to turn on."}>
+      <button
+        role="switch"
+        aria-checked={on}
+        aria-label="AI menu on selected text"
+        onClick={() => setOn(!on)}
+        className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-ink-soft transition-colors hover:bg-paper-edge hover:text-ink"
+      >
+        <span>AI on selection</span>
+        <span aria-hidden="true" className={`relative inline-block h-4 w-7 rounded-full transition-colors ${on ? "bg-accent" : "bg-line"}`}>
+          <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow-sm transition-all ${on ? "left-3.5" : "left-0.5"}`} />
+        </span>
+      </button>
+    </IconTip>
   );
 }

@@ -66,6 +66,7 @@ export function SelectionMenu() {
       capture: captureSelection,
       card: () => cardRef.current,
       close: () => setSel(null),
+      enabled: () => useUi.getState().selectionAi,
       open: (captured, contextEvent) => {
         setSel(contextEvent ? { ...captured, anchor: { x: contextEvent.clientX, y: contextEvent.clientY } } : captured);
         setResult(null);
@@ -74,7 +75,9 @@ export function SelectionMenu() {
       },
     });
     dismissRef.current = events.dismiss;
-    return events.dispose;
+    // Turning the switch off closes a menu that is already open.
+    const off = useUi.subscribe((s) => { if (!s.selectionAi) events.dismiss(); });
+    return () => { off(); events.dispose(); };
   }, []);
 
   async function run(action: TransformAction, replaces: boolean, instruction?: string) {

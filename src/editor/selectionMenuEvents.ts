@@ -15,11 +15,13 @@ function identity(selection: MenuSelection): string {
   return `${start}:${prefix.toString().length}:${selection.text}`;
 }
 
-export function installSelectionMenuEvents<T extends MenuSelection>({ capture, open, close, card }: {
+export function installSelectionMenuEvents<T extends MenuSelection>({ capture, open, close, card, enabled = () => true }: {
   capture: () => T | null;
   open: (selection: T, contextEvent?: MouseEvent) => void;
   close: () => void;
   card: () => HTMLElement | null;
+  /** When false the menu never opens and right-click keeps the browser's menu. */
+  enabled?: () => boolean;
 }) {
   let origin: HTMLElement | null = null;
   let active: T | null = null;
@@ -42,7 +44,7 @@ export function installSelectionMenuEvents<T extends MenuSelection>({ capture, o
     const startedIn = origin;
     origin = null;
     if (event.button !== 0) return;
-    if (!startedIn) { dismiss(); return; }
+    if (!startedIn || !enabled()) { dismiss(); return; }
     const selection = capture();
     if (!selection || selection.host !== startedIn) {
       active = null;
@@ -57,7 +59,7 @@ export function installSelectionMenuEvents<T extends MenuSelection>({ capture, o
   }
   function onContextMenu(event: MouseEvent) {
     const host = editorAt(event.target);
-    if (!host) return;
+    if (!host || !enabled()) return;
     const selection = capture();
     if (!selection || selection.host !== host) return;
     event.preventDefault();

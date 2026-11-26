@@ -28,6 +28,9 @@ interface UiState {
   /** OCR ("scan handwriting") dialog open. */
   ocrOpen: boolean;
   setOcrOpen: (v: boolean) => void;
+  /** Show the floating AI menu when text is selected (and on right-click). */
+  selectionAi: boolean;
+  setSelectionAi: (v: boolean) => void;
   toggleAiPanel: () => void;
   setAiPanel: (open: boolean) => void;
   toggleObjectBar: () => void;
@@ -37,6 +40,15 @@ interface UiState {
   zoomIn: () => void;
   zoomOut: () => void;
   fitZoom: () => void;
+}
+
+const SELECTION_AI_KEY = "harfsaz.selectionAi";
+function readSelectionAi(): boolean {
+  try {
+    return localStorage.getItem(SELECTION_AI_KEY) !== "off";
+  } catch {
+    return true;
+  }
 }
 
 const clampZoom = (z: number) => Math.max(0.25, Math.min(2, Math.round(z * 100) / 100));
@@ -59,6 +71,15 @@ export const useUi = create<UiState>((set) => ({
   setSettingsOpen: (v) => set({ settingsOpen: v }),
   ocrOpen: false,
   setOcrOpen: (v) => set({ ocrOpen: v }),
+  selectionAi: readSelectionAi(),
+  setSelectionAi: (v) => {
+    try {
+      localStorage.setItem(SELECTION_AI_KEY, v ? "on" : "off");
+    } catch {
+      /* private mode etc.: the choice lasts for this session only */
+    }
+    set({ selectionAi: v });
+  },
   toggleAiPanel: () => set((s) => ({ aiPanelOpen: !s.aiPanelOpen })),
   setAiPanel: (open) => set({ aiPanelOpen: open }),
   toggleObjectBar: () => set((s) => ({ objectBarOpen: !s.objectBarOpen })),
