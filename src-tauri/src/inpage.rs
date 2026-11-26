@@ -124,57 +124,86 @@ fn find(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|p| p + from)
 }
 
+/// Decode the character starting at `rec[i]`. Returns the character (None for
+/// bytes that are formatting/control codes we skip) and how many bytes it used:
+/// 2 for an `0x04`-escaped script character, 1 otherwise.
+fn decode_char(rec: &[u8], i: usize) -> (Option<char>, usize) {
+    let ch = rec[i];
+    if (0x08 < ch && ch < 0x0E) || (0x1F < ch && ch < 0xFF) {
+        // Plain byte: Latin-1 passthrough (ASCII punctuation, digits, Latin).
+        return (Some(ch as char), 1);
+    }
+    if ch == 0x04 {
+        // Escaped script character.
+        let Some(&c) = rec.get(i + 1) else { return (None, 1) };
+        let cp: u32 = match c {
+            0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 => c as u32,
+            0x3A => 0x005E,
+            0xCB => 0xFDF2, // ﷲ
+            0xDA => 0x0021,
+            0xDB => 0x007D,
+            0xDC => 0x007B,
+            0xDD => 0x0024,
+            0xDF => 0x002F,
+            0xE0 => 0x2026, // …
+            0xE1 => 0x0029,
+            0xE2 => 0x0028,
+            0xE3 => 0x002A,
+            0xE4 => 0x002B,
+            0xE9 => 0x003A,
+            0xEB => 0x00D7,
+            0xEC => 0x003D,
+            0xEF => 0x00F7,
+            0xF5 => 0x2212,
+            0xF6 => 0xFDFA, // ﷺ
+            0xFA => 0x005D,
+            0xFB => 0x005B,
+            0xFC => 0x002E,
+            0xFD => 0x2018,
+            0xFE => 0x2019,
+            _ => 0x0600 + UNICODE_LOW[c as usize] as u32,
+        };
+        return (char::from_u32(cp), 2);
+    }
+    // Any other byte (control codes, 0xFF) is formatting we don't decode.
+    (None, 1)
+}
+
 /// Decode one text record's bytes (excluding its trailing 0x0D) into a string.
 fn decode_record(rec: &[u8]) -> String {
     let mut out = String::with_capacity(rec.len());
     let mut i = 0;
     while i < rec.len() {
-        let ch = rec[i];
-        if (0x08 < ch && ch < 0x0E) || (0x1F < ch && ch < 0xFF) {
-            // Plain byte: Latin-1 passthrough (ASCII punctuation, digits, Latin).
-            out.push(ch as char);
-        } else if ch == 0x04 {
-            // Escaped script character.
-            if i + 1 >= rec.len() {
-                break;
-            }
-            i += 1;
-            let c = rec[i];
-            let cp: u32 = match c {
-                0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 => c as u32,
-                0x3A => 0x005E,
-                0xCB => 0xFDF2, // ﷲ
-                0xDA => 0x0021,
-                0xDB => 0x007D,
-                0xDC => 0x007B,
-                0xDD => 0x0024,
-                0xDF => 0x002F,
-                0xE0 => 0x2026, // …
-                0xE1 => 0x0029,
-                0xE2 => 0x0028,
-                0xE3 => 0x002A,
-                0xE4 => 0x002B,
-                0xE9 => 0x003A,
-                0xEB => 0x00D7,
-                0xEC => 0x003D,
-                0xEF => 0x00F7,
-                0xF5 => 0x2212,
-                0xF6 => 0xFDFA, // ﷺ
-                0xFA => 0x005D,
-                0xFB => 0x005B,
-                0xFC => 0x002E,
-                0xFD => 0x2018,
-                0xFE => 0x2019,
-                _ => 0x0600 + UNICODE_LOW[c as usize] as u32,
-            };
-            if let Some(chr) = char::from_u32(cp) {
-                out.push(chr);
-            }
+        let (chr, used) = decode_char(rec, i);
+        if let Some(chr) = chr {
+            out.push(chr);
         }
-        // Any other byte (control codes, 0xFF) is formatting we don't decode.
-        i += 1;
+        i += used;
     }
     out
+}
+
+/// InPage typists often use the bari-ye key (ے) inside a word — InPage draws it
+/// as a joined medial ye, so "فرےق" looks like "فریق" there. Unicode ے cannot
+/// join to the following letter, so the imported word visibly breaks. A ے that
+/// is directly followed by a letter is therefore a choti ye (ی). Word-final ے
+/// (before a space, punctuation, a digit or the end) is a real bari ye and stays.
+fn fix_bari_ye(chars: &mut [char]) {
+    let is_letter = |c: char| {
+        matches!(c, '\u{0621}'..='\u{064A}' | '\u{066E}'..='\u{06D3}' | '\u{06D5}' | '\u{06EE}'..='\u{06EF}' | '\u{06FA}'..='\u{06FF}')
+    };
+    for i in 0..chars.len().saturating_sub(1) {
+        if chars[i] == '\u{06D2}' && is_letter(chars[i + 1]) {
+            chars[i] = '\u{06CC}';
+        }
+    }
+}
+
+/// Decode a record and apply the bari-ye correction.
+fn decode_paragraph(rec: &[u8]) -> String {
+    let mut chars: Vec<char> = decode_record(rec).chars().collect();
+    fix_bari_ye(&mut chars);
+    chars.into_iter().collect()
 }
 
 /// Extract paragraphs from a pre-3.0 InPage file. Empty when no records found.
@@ -220,7 +249,7 @@ fn extract_legacy(raw: &[u8]) -> Vec<String> {
             if reclen == 0 || pos + reclen > buf.len() || buf[pos + reclen - 1] != 0x0D {
                 continue 'outer;
             }
-            paragraphs.push(decode_record(&buf[pos..pos + reclen - 1]));
+            paragraphs.push(decode_paragraph(&buf[pos..pos + reclen - 1]));
             pos += reclen;
         }
     }
@@ -346,6 +375,25 @@ mod tests {
 
         let paragraphs = extract_legacy(&buf);
         assert_eq!(paragraphs, vec!["", "", "اب", "\u{0628}", "ا"]);
+    }
+
+    #[test]
+    fn bari_ye_typed_inside_a_word_becomes_choti_ye() {
+        // InPage typists use the bari-ye key mid-word; InPage draws it as a
+        // joined ye, but Unicode ے cannot join forward and breaks the word.
+        let fixed = |s: &str| {
+            let mut chars: Vec<char> = s.chars().collect();
+            fix_bari_ye(&mut chars);
+            chars.into_iter().collect::<String>()
+        };
+        assert_eq!(fixed("فرےق مےں ےا"), "فریق میں یا");
+        // Word-final bari ye is real and must stay — including before punctuation.
+        assert_eq!(fixed("لےے ہے۔ کرلے، دے 2"), "لیے ہے۔ کرلے، دے 2");
+        // The decoder applies it to every paragraph.
+        let mut buf = vec![0x0D, 0, 0, 0, 0, 0];
+        buf.extend(rec(&[0x04, 0xA5, 0x04, 0x81])); // ے then ا  → یا
+        buf.extend([0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(extract_legacy(&buf), vec!["یا"]);
     }
 
     #[test]
