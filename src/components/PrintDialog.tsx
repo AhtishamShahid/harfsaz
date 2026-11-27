@@ -287,8 +287,8 @@ export function PrintDialog() {
                   <span className="font-medium text-ink">Vector (print-grade)</span>
                   <span className="block text-ink-soft">
                     {isTauri()
-                      ? "True glyph outlines from the Nastaliq shaper — sharp at any size, small file. Best for printing and publishers."
-                      : "Needs the desktop app — its Rust shaper writes true glyph outlines. The browser exports an image PDF."}
+                      ? "Text set by the Nastaliq shaper with its font embedded — sharp at any size, small file. Best for printing and publishers."
+                      : "Needs the desktop app — its Rust shaper sets the text. The browser exports an image PDF."}
                   </span>
                 </span>
               </label>

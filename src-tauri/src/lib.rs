@@ -5,11 +5,12 @@ mod account;
 mod ai;
 mod inpage;
 mod printing;
+mod pdf;
 mod settings;
 mod shaping;
 
 use ai::{AiRequest, AiResponse};
-use shaping::{RenderLayout, ShapedRun};
+use shaping::ShapedRun;
 
 /// Shape a run of (Urdu) text into positioned glyphs.
 ///
@@ -19,20 +20,81 @@ fn shape_text(text: String, font_bytes: Vec<u8>, font_size: f32) -> Result<Shape
     shaping::shape_text(&text, &font_bytes, font_size)
 }
 
-/// Lay out text into a frame and return positioned vector glyphs (SVG paths) —
-/// the print-grade render path.
+/// Make a font available to the shaper. The body is the raw font file and the
+/// `font-key` header names it; later calls refer to the font by that key, so
+/// the file crosses the bridge once instead of with every layout.
+///
+/// Async, so parsing the font and building its first shape plan (the slow
+/// part for Gulzar) runs off the main thread instead of stalling the window.
 #[tauri::command]
-fn layout_text(
+async fn register_font(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let key = request
+        .headers()
+        .get("font-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("register_font needs a font-key header")?
+        .to_string();
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        // The bridge may fall back to JSON (an array of byte values).
+        tauri::ipc::InvokeBody::Json(value) => serde_json::from_value(value.clone()).map_err(|e| e.to_string())?,
+    };
+    tauri::async_runtime::spawn_blocking(move || shaping::register_font(&key, bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// A text frame to lay out, as the frontend describes it.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FrameSpec {
+    font_key: String,
     text: String,
-    font_bytes: Vec<u8>,
     font_size: f32,
-    frame_width: f32,
+    width: f32,
     align: Option<String>,
     line_height: Option<f32>,
-) -> Result<RenderLayout, String> {
-    // "justify" triggers kashida elongation; other values just set line origin.
-    let align = align.unwrap_or_else(|| "right".to_string());
-    shaping::layout_text(&text, &font_bytes, font_size, frame_width, &align, line_height)
+}
+
+/// Layouts run on the blocking pool, at most one per core at a time, so a
+/// document's worth of preview frames neither blocks the UI thread nor starts
+/// hundreds of threads.
+fn layout_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()))
+    })
+}
+
+/// Lay out a text frame for print preview: an SVG path per line.
+#[tauri::command]
+async fn layout_preview(frame: FrameSpec) -> Result<shaping::PreviewLayout, String> {
+    let _permit = layout_permits().acquire().await.map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let font = shaping::font(&frame.font_key)?;
+        // "justify" triggers kashida elongation; other values just set line origin.
+        let align = frame.align.as_deref().unwrap_or("right");
+        let layout = shaping::layout_frame(&font, &frame.text, frame.font_size, frame.width, align, frame.line_height);
+        Ok(shaping::preview_paths(&font, &layout))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Render the document to a vector PDF in the temp directory; returns its path.
+#[tauri::command]
+async fn render_pdf(document: pdf::PrintDoc) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = pdf::render(&document)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let path = std::env::temp_dir().join(format!("harfsaz-vector-{stamp}.pdf"));
+        std::fs::write(&path, bytes).map_err(|e| format!("Could not write the PDF: {e}"))?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Run an AI task (write / proofread / translate / layout) via Claude.
@@ -183,7 +245,9 @@ pub fn run() {
             account::desktop_account,
             account::desktop_ai,
             shape_text,
-            layout_text,
+            register_font,
+            layout_preview,
+            render_pdf,
             ai_task,
             ai_chat,
             ai_proofread_inline,

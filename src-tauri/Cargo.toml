@@ -6,7 +6,7 @@ authors = ["HarfSaz <info@harfsaz.com>"]
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/harfsaz/harfsaz"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.85"
 
 [lib]
 name = "harfsaz_lib"
@@ -22,10 +22,21 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Nastaliq shaping — rustybuzz is a pure-Rust port of HarfBuzz (no C toolchain needed).
-# It includes the same Nastaliq/Arabic complex-shaping logic HarfBuzz uses.
-rustybuzz = "0.20"
+# Nastaliq shaping — harfrust is the HarfBuzz project's pure-Rust port of
+# HarfBuzz (no C toolchain needed), with the same Nastaliq/Arabic shaping logic.
+# It shapes 4-6x faster than rustybuzz, which it replaced, with identical output
+# on the bundled fonts. ttf-parser reads outlines and metrics.
+harfrust = "0.16"
 ttf-parser = "0.25"
+
+# Vector PDF output: written in Rust with the fonts embedded, instead of
+# drawing every glyph outline through jsPDF in the webview.
+pdf-writer = "0.15"
+miniz_oxide = "0.8"
+png = "0.17"
+base64 = "0.22"
+# Lays out pages and paragraphs on all cores.
+rayon = "1"
 
 # Claude (Anthropic) API bridge
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -33,6 +44,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+# Shaping Nastaliq is slow without optimisation (an 18-page document took about
+# 30 s to lay out in a debug build), so optimise dependencies in dev builds too.
+[profile.dev.package."*"]
+opt-level = 3
 
 # Optimized release builds: smaller, faster binary for distribution.
 [profile.release]

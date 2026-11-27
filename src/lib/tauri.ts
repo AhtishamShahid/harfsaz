@@ -31,7 +31,7 @@ export interface ShapedRun {
   rtl: boolean;
 }
 
-/** Shape Urdu text into positioned glyphs via the Rust HarfBuzz/rustybuzz core. */
+/** Shape Urdu text into positioned glyphs via the Rust HarfBuzz (harfrust) core. */
 export function shapeText(
   text: string,
   fontBytes: Uint8Array,
@@ -45,46 +45,57 @@ export function shapeText(
   });
 }
 
-export interface RenderGlyph {
-  glyph_id: number;
-  cluster: number;
-  pen_x: number;
-  pen_y: number;
-  x_offset: number;
-  y_offset: number;
-  path: string;
-}
-export interface RenderLine {
-  glyphs: RenderGlyph[];
-  width: number;
-  baseline_y: number;
-}
-export interface RenderLayout {
-  lines: RenderLine[];
-  used_height: number;
-  rtl: boolean;
+/** Give the Rust shaper a font file, sent once and then referred to by key. */
+export function registerShaperFont(key: string, bytes: Uint8Array): Promise<void> {
+  ensureTauri("Print-grade rendering");
+  return invoke<void>("register_font", bytes, { headers: { "font-key": key } });
 }
 
-/** Lay out text into vector glyphs (SVG paths) — the print-grade render path. */
-export function layoutText(
-  text: string,
-  fontBytes: Uint8Array,
-  fontSize: number,
-  frameWidth: number,
+/** A text frame for the shaper to lay out (its font registered first). */
+export interface FrameSpec {
+  fontKey: string;
+  text: string;
+  fontSize: number;
+  width: number;
   /** "justify" elongates letters with kashida; others only set the line origin. */
-  align: "right" | "center" | "left" | "justify" = "right",
+  align?: "right" | "center" | "left" | "justify";
   /** Line height as a multiple of the font size (the frame's lineHeight). */
-  lineHeight?: number
-): Promise<RenderLayout> {
+  lineHeight?: number | null;
+}
+
+/** Print preview of a frame: SVG path data for each line, in frame px. */
+export interface PreviewLayout {
+  lines: string[];
+  used_height: number;
+}
+
+/** Lay out a frame for print preview — the print-grade render path. */
+export function layoutPreview(frame: FrameSpec): Promise<PreviewLayout> {
   ensureTauri("Print-grade rendering");
-  return invoke<RenderLayout>("layout_text", {
-    text,
-    fontBytes: Array.from(fontBytes),
-    fontSize,
-    frameWidth,
-    align,
-    lineHeight: lineHeight ?? null,
-  });
+  return invoke<PreviewLayout>("layout_preview", { frame });
+}
+
+type Rgb = [number, number, number];
+
+/** What is drawn on a PDF page, back to front, in page px. */
+export type PrintItem =
+  | { kind: "rect"; x: number; y: number; width: number; height: number; fill: Rgb | null; stroke: Rgb | null; lineWidth: number }
+  | ({ kind: "text"; x: number; y: number; color: Rgb } & Required<Omit<FrameSpec, "lineHeight">> & { lineHeight: number | null })
+  /** `data` is a PNG or JPEG data URL. */
+  | { kind: "image"; x: number; y: number; width: number; height: number; data: string }
+  /** SVG path data (absolute M, L, Q, C, Z) from (x, y). */
+  | { kind: "path"; x: number; y: number; d: string; fill: Rgb | null; stroke: Rgb | null; lineWidth: number };
+
+export interface PrintPage {
+  width: number;
+  height: number;
+  items: PrintItem[];
+}
+
+/** Write a vector PDF of `pages` (fonts registered first); returns its temp path. */
+export function renderVectorPdf(pages: PrintPage[]): Promise<string> {
+  ensureTauri("Vector PDF export");
+  return invoke<string>("render_pdf", { document: { pages } });
 }
 
 // ---- AI ----

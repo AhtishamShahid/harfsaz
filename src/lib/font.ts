@@ -2,6 +2,8 @@
 // needs a CSS @font-face. All fonts are OFL-licensed (free for commercial use)
 // and bundled under /public/fonts. Grouped by script style for the dropdown.
 
+import { registerShaperFont } from "./tauri";
+
 export type FontStyle =
   | "Nastaliq"
   | "Naskh"
@@ -140,6 +142,25 @@ export async function loadFontBytes(key: string): Promise<Uint8Array> {
   if (buf.byteLength < 1000) throw new Error(`Font file too small: ${font.label}`);
   byteCache.set(key, buf);
   return buf;
+}
+
+const shaperFonts = new Map<string, Promise<void>>();
+
+/**
+ * Load a font into the Rust shaper (print preview and vector PDF), once per
+ * font. Returns the key the shaper knows it by: frames may carry a legacy key.
+ */
+export async function ensureShaperFont(key: string): Promise<string> {
+  const k = getFont(key).key;
+  let loaded = shaperFonts.get(k);
+  if (!loaded) {
+    loaded = loadFontBytes(k).then((bytes) => registerShaperFont(k, bytes));
+    shaperFonts.set(k, loaded);
+    // A failed load must not stick: let a later call try again.
+    loaded.catch(() => shaperFonts.delete(k));
+  }
+  await loaded;
+  return k;
 }
 
 /**

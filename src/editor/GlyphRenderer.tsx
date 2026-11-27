@@ -1,15 +1,16 @@
-import { useEffect, useState } from "react";
-import { layoutText, RenderLayout, isTauri } from "../lib/tauri";
-import { loadFontBytes } from "../lib/font";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { layoutPreview, PreviewLayout, isTauri } from "../lib/tauri";
+import { ensureShaperFont } from "../lib/font";
 
 /**
- * Print-grade renderer: draws the exact vector glyph outlines produced by the
- * Rust HarfBuzz/rustybuzz shaper as SVG paths. This is the path that will drive
- * pixel-precise justification and PDF export — independent of the browser's own
- * text shaping.
+ * Print-grade renderer: draws the glyph outlines placed by the Rust
+ * HarfBuzz (harfrust) shaper as SVG paths (one per line), the same layout the
+ * vector PDF uses — independent of the browser's own text shaping.
  *
- * Only functional inside the Tauri runtime (it calls the Rust `layout_text`
- * command). In a plain browser tab it shows a hint instead.
+ * Only functional inside the Tauri runtime (it calls the Rust shaper). In a
+ * plain browser tab it shows a hint instead. A frame is laid out once it comes
+ * near the visible part of the canvas, so a long document doesn't shape every
+ * page before showing the first.
  */
 export function GlyphRenderer({
   text,
@@ -30,16 +31,18 @@ export function GlyphRenderer({
   /** Line height as a multiple of the font size. */
   lineHeight?: number;
 }) {
-  const [layout, setLayout] = useState<RenderLayout | null>(null);
+  const [layout, setLayout] = useState<PreviewLayout | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const box = useRef<HTMLDivElement>(null);
+  const near = useNearView(box);
 
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || !near) return;
     let alive = true;
     (async () => {
       try {
-        const font = await loadFontBytes(fontKey);
-        const result = await layoutText(text, font, fontSize, width, align, lineHeight);
+        const key = await ensureShaperFont(fontKey);
+        const result = await layoutPreview({ fontKey: key, text, fontSize, width, align, lineHeight });
         if (alive) {
           setLayout(result);
           setError(null);
@@ -51,7 +54,7 @@ export function GlyphRenderer({
     return () => {
       alive = false;
     };
-  }, [text, fontSize, width, fontKey, align, lineHeight]);
+  }, [near, text, fontSize, width, fontKey, align, lineHeight]);
 
   if (!isTauri()) {
     return (
@@ -62,44 +65,56 @@ export function GlyphRenderer({
     );
   }
 
-  if (error) return <div className="render-error">{error}</div>;
-  if (!layout) return <div className="render-hint">Shaping…</div>;
-
-  const overflow = layout.used_height > height;
+  const overflow = !!layout && layout.used_height > height;
   const clipId = `frame-clip-${width}x${height}`;
 
   return (
-    <svg
-      className="glyph-svg"
-      width={width}
-      height={height}
-      viewBox={`0 0 ${width} ${height}`}
-    >
-      {/* Clip glyphs to the frame so nothing bleeds past its edges. */}
-      <defs>
-        <clipPath id={clipId}>
-          <rect x={0} y={0} width={width} height={height} />
-        </clipPath>
-      </defs>
-      <g clipPath={`url(#${clipId})`}>
-        {layout.lines.flatMap((line, li) =>
-          line.glyphs.map(
-            (g, gi) =>
-              g.path && (
-                <path key={`${li}-${gi}`} d={g.path} className="glyph-path" />
-              )
-          )
-        )}
-      </g>
-      {overflow && (
-        <rect
-          x={0}
-          y={height - 4}
-          width={width}
-          height={4}
-          className="overflow-marker"
-        />
+    <div ref={box} style={{ width, height }}>
+      {error ? (
+        <div className="render-error">{error}</div>
+      ) : !layout ? (
+        <div className="render-hint">Shaping…</div>
+      ) : (
+        <svg className="glyph-svg" width={width} height={height} viewBox={`0 0 ${width} ${height}`}>
+          {/* Clip glyphs to the frame so nothing bleeds past its edges. */}
+          <defs>
+            <clipPath id={clipId}>
+              <rect x={0} y={0} width={width} height={height} />
+            </clipPath>
+          </defs>
+          <g clipPath={`url(#${clipId})`}>
+            {layout.lines.map((d, i) => d && <path key={i} d={d} className="glyph-path" />)}
+          </g>
+          {overflow && (
+            <rect x={0} y={height - 4} width={width} height={4} className="overflow-marker" />
+          )}
+        </svg>
       )}
-    </svg>
+    </div>
   );
+}
+
+/** True once `ref` has come within a screen's height of the canvas viewport. */
+function useNearView(ref: RefObject<Element | null>): boolean {
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (near || !el) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setNear(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setNear(true);
+          observer.disconnect();
+        }
+      },
+      { root: el.closest("#document-canvas"), rootMargin: "100% 0px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref, near]);
+  return near;
 }
