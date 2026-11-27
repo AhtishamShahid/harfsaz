@@ -52,6 +52,7 @@ export function Toolbar() {
 
   // Select all pages (⌘A twice, or Edit ▸ Select all pages) → every page frame.
   const allPages = useUi((s) => s.allPagesSelected);
+  const editing = useUi((s) => s.viewMode === "edit");
   const patch = (p: Partial<TextFrame>) => {
     if (allPages) useDoc.getState().updatePageFrames(p);
     else if (sel) updateFrame(sel.page.id, sel.frame.id, p);
@@ -91,7 +92,9 @@ export function Toolbar() {
       return;
     }
     const target = sizeSelection.current;
-    if (!allPages && target?.host.isConnected) {
+    // In print preview the editor is hidden, not gone: size the whole frame,
+    // not a selection made before preview opened.
+    if (!allPages && editing && target?.host.isConnected) {
       if (!coversWholeEditor(target)) {
         const next = applySelectionSize(target, size);
         if (next) {

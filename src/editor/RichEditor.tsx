@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { transliterate } from "./phonetic";
-import { clipboardToLines, escapeHtml, sanitizeStoredHtml } from "./sanitize";
+import { clipboardToLines, escapeHtml, plainText, sanitizeStoredHtml, shownInPage } from "./sanitize";
 import { LangCode, Dir } from "../lib/languages";
 
 /**
@@ -87,7 +87,8 @@ export function RichEditor({
     const html = el.innerHTML;
     if (html === lastEmitted.current) return;
     lastEmitted.current = html;
-    onChange(html, el.innerText, event?.type === "harfsaz-format");
+    // Hidden during print preview, where innerText would read as empty.
+    onChange(html, shownInPage(el) ? el.innerText : plainText(el), event?.type === "harfsaz-format");
   }
 
   // Phonetic transliteration must use a NATIVE `beforeinput` listener: React's

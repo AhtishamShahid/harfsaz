@@ -136,6 +136,39 @@ export function clipboardToLines(data: DataTransfer): string[] {
     .filter((l, i, arr) => !(l === "" && arr[i - 1] === ""));
 }
 
+const BLOCK_TAGS = /^(DIV|P|LI|UL|OL|H[1-6]|BLOCKQUOTE|PRE|TABLE|TR)$/;
+
+/**
+ * An editor's plain text, one line per block, read from the DOM. Unlike
+ * `innerText` it doesn't depend on rendering: `innerText` leaves out text that
+ * isn't visible, and print preview keeps the editor hidden rather than
+ * removed. Text typed straight into an empty editor (no block yet) counts as
+ * its first line.
+ */
+export function plainText(el: HTMLElement): string {
+  const lines: string[] = [];
+  let line: string | null = null;
+  for (const node of Array.from(el.childNodes)) {
+    if (node instanceof HTMLElement && BLOCK_TAGS.test(node.tagName)) {
+      if (line !== null) lines.push(line);
+      line = null;
+      lines.push(node.textContent ?? "");
+    } else if (node instanceof HTMLBRElement) {
+      lines.push(line ?? "");
+      line = null;
+    } else {
+      line = (line ?? "") + (node.textContent ?? "");
+    }
+  }
+  if (line !== null) lines.push(line);
+  return lines.join("\n");
+}
+
+/** Whether `el` is in the page and visible, so `innerText` reads all of it. */
+export function shownInPage(el: HTMLElement): boolean {
+  return el.isConnected && getComputedStyle(el).visibility !== "hidden";
+}
+
 /** Escape text for insertion as HTML. */
 export function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

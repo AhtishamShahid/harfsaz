@@ -37,6 +37,9 @@ export function TextFrameView({ pageId, frame }: { pageId: string; frame: TextFr
   const selected = selectedFrameId === frame.id;
   const font = getFont(frame.fontKey);
   const fontFamily = `"${font.cssFamily}", serif`;
+  // Print preview shows the shaper's glyphs, except for rich layouts (lists,
+  // tables, styled paragraphs), which the read-only editor shows as they are.
+  const glyphPreview = mode === "preview" && !needsRichLayout(frame.html);
   const hasSuggestions = useSuggestions(
     (s) => s.items.some((i) => i.frameId === frame.id)
   );
@@ -50,6 +53,14 @@ export function TextFrameView({ pageId, frame }: { pageId: string; frame: TextFr
     updateFrame(pageId, frame.id, { text: next, html: "" });
     relocate(frame.id, next);
   }
+
+  // The editor stays in place, hidden, under print preview: take the caret out
+  // of it so typing can't change the text while it's hidden.
+  useEffect(() => {
+    if (!glyphPreview) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (active?.closest(`.text-frame-edit[data-frame-id="${CSS.escape(frame.id)}"]`)) active.blur();
+  }, [glyphPreview, frame.id]);
 
   // Register the @font-face so the edit layer renders this family.
   useEffect(() => {
@@ -169,30 +180,41 @@ export function TextFrameView({ pageId, frame }: { pageId: string; frame: TextFr
           fontFamily={fontFamily}
           onApply={applyCorrection}
         />
-      ) : mode === "edit" || needsRichLayout(frame.html) ? (
-        <RichEditor
-          frameId={frame.id}
-          readOnly={mode === "preview"}
-          html={frame.html}
-          fallbackText={frame.text}
-          phonetic={phonetic}
-          lang={frame.lang}
-          dir={frame.dir}
-          phoneticMap={getLanguage(frame.lang).phoneticMap}
-          style={textStyle}
-          onChange={handleRichChange}
-          revision={revision}
-        />
       ) : (
-        <GlyphRenderer
-          text={frame.text}
-          fontSize={frame.fontSize}
-          width={frame.width}
-          height={frame.height}
-          fontKey={frame.fontKey}
-          align={frame.align}
-          lineHeight={frame.lineHeight}
-        />
+        <>
+          {/* Print preview draws the shaper's glyphs over the editor rather
+              than replacing it: the editor stays laid out underneath (hidden),
+              so going back to Write mode doesn't make the browser lay every
+              page out again (seconds on a long Nastaliq document). It stays
+              editable for the same reason (switching that re-lays it out);
+              hidden and unfocused, it can't be typed into. */}
+          <RichEditor
+            frameId={frame.id}
+            readOnly={mode === "preview" && !glyphPreview}
+            html={frame.html}
+            fallbackText={frame.text}
+            phonetic={phonetic}
+            lang={frame.lang}
+            dir={frame.dir}
+            phoneticMap={getLanguage(frame.lang).phoneticMap}
+            style={glyphPreview ? { ...textStyle, visibility: "hidden" } : textStyle}
+            onChange={handleRichChange}
+            revision={revision}
+          />
+          {glyphPreview && (
+            <div className="absolute inset-0">
+              <GlyphRenderer
+                text={frame.text}
+                fontSize={frame.fontSize}
+                width={frame.width}
+                height={frame.height}
+                fontKey={frame.fontKey}
+                align={frame.align}
+                lineHeight={frame.lineHeight}
+              />
+            </div>
+          )}
+        </>
       )}
 
       {/* Move grip + resize handles for selected non-page text frames. The grip

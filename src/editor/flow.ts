@@ -22,6 +22,7 @@ import { useEffect } from "react";
 import { useDoc, type Page, type TextFrame } from "../lib/store";
 import { useUi } from "../lib/ui";
 import { ensureFontFace } from "../lib/font";
+import { plainText, shownInPage } from "./sanitize";
 
 export const CONT = "data-harfsaz-cont";
 const BLOCK_TAGS = new Set(["DIV", "P", "OL", "UL", "TABLE", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE"]);
@@ -120,55 +121,76 @@ interface LineStart {
   center: number;
 }
 
-/** The first word of every visual line of a block. */
-function lineStarts(el: HTMLElement, block: HTMLElement): LineStart[] {
+/** A visual line of a block: its middle and bottom, page px from the editor's top. */
+interface Line {
+  center: number;
+  bottom: number;
+  /** The first text node with letters on this line. */
+  node: Text;
+}
+
+/** Combining marks and the second half of surrogate pairs: never a line start. */
+const ATTACHED = /[\uDC00-\uDFFF\u0300-\u036F\u064B-\u065F\u0670\u06D6-\u06ED]/;
+
+/**
+ * The visual lines of a block, read from one rectangle query per text node.
+ * Where a line starts in the text is only looked up when asked (`startOf`),
+ * for the few lines a page break falls on. That lookup measures single
+ * letters, and in a long run of letters without spaces WebKit re-measures the
+ * whole run for each one (about 7 ms a letter): measuring every letter of
+ * every line up front froze the editor for minutes on such a document.
+ */
+function blockLines(el: HTMLElement, block: HTMLElement): { lines: Line[]; startOf: (k: number) => LineStart | null } {
   const elTop = el.getBoundingClientRect().top;
   const scale = scaleOf(el);
   const half = lineHeightOf(block) / 2;
-  const out: LineStart[] = [];
-  let lastCenter = -Infinity;
+  const lines: Line[] = [];
   const range = document.createRange();
-  /** Record (node, i) as a line start if its letter sits on a new line. */
-  const visit = (node: Text, i: number) => {
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+    if (!node.data.trim()) continue;
+    range.selectNodeContents(node);
+    for (const rect of Array.from(range.getClientRects())) {
+      if (rect.height <= 0 || rect.width <= 0) continue;
+      const center = ((rect.top + rect.bottom) / 2 - elTop) / scale;
+      const last = lines[lines.length - 1];
+      if (!last || center > last.center + half) lines.push({ center, bottom: center + half, node });
+    }
+  }
+  /** Middle of letter `i` of `node`, or null when it takes no room (a joiner). */
+  const centerOf = (node: Text, i: number): number | null => {
     range.setStart(node, i);
     range.setEnd(node, i + 1);
     const rect = range.getBoundingClientRect();
-    if (rect.height <= 0) return;
-    const center = ((rect.top + rect.bottom) / 2 - elTop) / scale;
-    if (center > lastCenter + half) {
-      out.push({ node, offset: i, bottom: center + half, center });
-      lastCenter = center;
-    }
+    return rect.height > 0 ? ((rect.top + rect.bottom) / 2 - elTop) / scale : null;
   };
-  let previousWasSpace = true;
-  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
-  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+  const startOf = (k: number): LineStart | null => {
+    if (k <= 0 || k >= lines.length) return null;
+    const { node, center, bottom } = lines[k];
     const text = node.data;
-    for (let i = 0; i < text.length; i++) {
-      const space = /\s/.test(text[i]);
-      if (!space && previousWasSpace) {
-        visit(node, i);
-        // A word longer than a line (e.g. letters typed without spaces) is
-        // wrapped inside itself; find where each of its lines begins letter by
-        // letter, so it can still be broken across pages.
-        let end = i + 1;
-        while (end < text.length && !/\s/.test(text[end])) end++;
-        if (end - i > 8) {
-          range.setStart(node, i);
-          range.setEnd(node, end);
-          if (range.getClientRects().length > 1) {
-            for (let c = i + 1; c < end; c++) {
-              // Never between a surrogate pair or before a combining mark.
-              if (/[\uDC00-\uDFFF\u0300-\u036F\u064B-\u065F\u0670\u06D6-\u06ED]/.test(text[c])) continue;
-              visit(node, c);
-            }
-          }
-        }
+    const above = lines[k - 1].center + half;
+    // Whether the first measurable letter from `i` on sits below line k-1.
+    // Lines follow the text, so this flips once along the node: bisect for it.
+    const below = (i: number): boolean => {
+      for (let j = i; j < text.length && j < i + 8; j++) {
+        const c = centerOf(node, j);
+        if (c !== null) return c > above;
       }
-      previousWasSpace = space;
+      return true;
+    };
+    let lo = 0;
+    let hi = text.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (below(mid)) hi = mid;
+      else lo = mid + 1;
     }
-  }
-  return out;
+    let i = lo;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    while (i > 0 && i < text.length && ATTACHED.test(text[i])) i--;
+    return i < text.length ? { node, offset: i, bottom, center } : null;
+  };
+  return { lines, startOf };
 }
 
 // ── DOM edits ────────────────────────────────────────────────────────────────
@@ -275,19 +297,22 @@ function pushOverflow(link: Link, target: HTMLElement): boolean {
   let k = all.findIndex((b) => (b.getBoundingClientRect().bottom - top) / scale > link.limit + 0.5);
   if (k === -1) k = all.length - 1;
   const block = all[k];
-  const lines = SPLITTABLE.has(block.tagName) ? lineStarts(link.el, block) : [];
-  let at: LineStart | "all" | "none" = "all";
+  const { lines, startOf } = SPLITTABLE.has(block.tagName) ? blockLines(link.el, block) : { lines: [], startOf: () => null };
+  // The line to split the block at (moving it and the rest), or all / none of it.
+  let at: number | "all" | "none" = "all";
   if (lines.length) {
     const firstOut = lines.findIndex((l) => l.bottom > link.limit + 0.5);
-    if (firstOut > 0) at = lines[firstOut];
+    if (firstOut > 0) at = firstOut;
     // The estimate says every line fits but the block still overflows: move its last line.
-    else if (firstOut === -1) at = lines.length > 1 ? lines[lines.length - 1] : "all";
+    else if (firstOut === -1) at = lines.length > 1 ? lines.length - 1 : "all";
   }
   // Never empty a page: keep the first line of its first block.
-  if (k === 0 && at === "all") at = lines.length > 1 ? lines[1] : "none";
+  if (k === 0 && at === "all") at = lines.length > 1 ? 1 : "none";
+  const start = typeof at === "number" ? startOf(at) : null;
+  if (typeof at === "number" && !start) at = k === 0 ? "none" : "all";
   const moving: HTMLElement[] = [];
   if (at === "all") moving.push(block);
-  else if (at !== "none") moving.push(split(block, at.node, at.offset));
+  else if (start) moving.push(split(block, start.node, start.offset));
   moving.push(...all.slice(k + 1));
   if (!moving.length) return false;
   prependAll(target, moving);
@@ -318,12 +343,13 @@ function pullFit(link: Link, source: HTMLElement): boolean {
       continue;
     }
     if (SPLITTABLE.has(b.tagName)) {
-      const lines = lineStarts(source, b);
+      const { lines, startOf } = blockLines(source, b);
       const blockTop = (r.top - sourceTop) / scale;
       let m = 0;
       while (m < lines.length && lines[m].bottom - blockTop <= free + 0.5) m++;
-      if (m >= 1 && m < lines.length) {
-        b.after(split(b, lines[m].node, lines[m].offset)); // the rest stays, as a continuation
+      const start = m >= 1 && m < lines.length ? startOf(m) : null;
+      if (start) {
+        b.after(split(b, start.node, start.offset)); // the rest stays, as a continuation
         moving.push(b);
       }
     }
@@ -384,9 +410,12 @@ interface Paragraph {
   parts: HTMLElement[];
   /** Space above it (its margin), page px. */
   preSpace: number;
-  /** Each line's height and, for all but the first, where it starts. */
-  lines: { height: number; start: LineStart | null }[];
+  /** Each line's height and, for all but the first, how to find where it starts
+   *  (looked up only for the lines a page break falls on; see blockLines). */
+  lines: { height: number; start: (() => LineStart | null) | null }[];
   splittable: boolean;
+  /** Where its blocks are now: the line each starts at, and its page in the run. */
+  placed: { line: number; page: number }[];
 }
 
 interface RunMeasure {
@@ -402,7 +431,7 @@ function measureRun(run: Link[]): RunMeasure {
     return first ? (first.getBoundingClientRect().top - link.el.getBoundingClientRect().top) / scaleOf(link.el) : 0;
   });
   const out: Paragraph[] = [];
-  for (const link of run) {
+  for (const [page, link] of run.entries()) {
     const top = link.el.getBoundingClientRect().top;
     const scale = scaleOf(link.el);
     let prevBottom: number | null = null;
@@ -411,15 +440,15 @@ function measureRun(run: Link[]): RunMeasure {
       const blockTop = (r.top - top) / scale;
       const blockBottom = (r.bottom - top) / scale;
       const splittable = SPLITTABLE.has(block.tagName);
-      const starts = splittable ? lineStarts(link.el, block) : [];
+      const { lines: found, startOf } = splittable ? blockLines(link.el, block) : { lines: [], startOf: () => null };
       const lines: Paragraph["lines"] = [];
-      if (starts.length < 2) {
+      if (found.length < 2) {
         lines.push({ height: blockBottom - blockTop, start: null });
       } else {
-        starts.forEach((st, k) => {
-          const lineTop = k === 0 ? blockTop : (starts[k - 1].center + st.center) / 2;
-          const lineBottom = k === starts.length - 1 ? blockBottom : (st.center + starts[k + 1].center) / 2;
-          lines.push({ height: lineBottom - lineTop, start: k === 0 ? null : st });
+        found.forEach((ln, k) => {
+          const lineTop = k === 0 ? blockTop : (found[k - 1].center + ln.center) / 2;
+          const lineBottom = k === found.length - 1 ? blockBottom : (ln.center + found[k + 1].center) / 2;
+          lines.push({ height: lineBottom - lineTop, start: k === 0 ? null : () => startOf(k) });
         });
       }
       const preSpace = prevBottom === null ? 0 : Math.max(0, blockTop - prevBottom);
@@ -428,10 +457,11 @@ function measureRun(run: Link[]): RunMeasure {
       if (block.hasAttribute(CONT) && last) {
         // The rest of a paragraph split at the previous page break.
         last.parts.push(block);
-        last.lines.push(...lines.map((l, k) => (k === 0 ? { ...l, start: firstStart(block) } : l)));
+        last.placed.push({ line: last.lines.length, page });
+        last.lines.push(...lines.map((l, k) => (k === 0 ? { ...l, start: () => firstStart(block) } : l)));
         last.splittable = last.splittable && splittable;
       } else {
-        out.push({ head: block, parts: [], preSpace, lines, splittable });
+        out.push({ head: block, parts: [], preSpace, lines, splittable, placed: [{ line: 0, page }] });
       }
     }
   }
@@ -458,16 +488,23 @@ function rawSplit(block: HTMLElement, node: Text, offset: number): HTMLElement {
   return tail;
 }
 
-/**
- * Re-break a run of continuing pages from one measurement. Returns the HTML
- * of pages to add after the run's last page, and the run pages left empty.
- */
-function repaginate(run: Link[], { paras: measured, tops: measuredTops }: RunMeasure): { extra: string[]; emptied: Link[] } {
+type Piece = { para: Paragraph; from: number; to: number };
+
+/** Which lines of which paragraph go on which page, and where in the text each
+ *  paragraph is cut (looked up now, before anything moves). */
+interface PagePlan {
+  pages: Piece[][];
+  cuts: Map<Paragraph, Map<number, LineStart>>;
+  /** Every paragraph would stay where it is: nothing to change. */
+  same: boolean;
+}
+
+/** Work out the page breaks of a run of continuing pages from one measurement. Reads only. */
+function planPages(run: Link[], { paras: measured, tops: measuredTops }: RunMeasure): PagePlan {
   const limitOf = (p: number) => run[Math.min(p, run.length - 1)].limit;
   const tops = measuredTops.length ? measuredTops : [0];
 
   // Work out the breaks: which lines of which paragraph go on which page.
-  type Piece = { para: Paragraph; from: number; to: number };
   const pages: Piece[][] = [[]];
   let p = 0;
   let y = tops[0];
@@ -494,20 +531,51 @@ function repaginate(run: Link[], { paras: measured, tops: measuredTops }: RunMea
     pages[p].push({ para, from, to: para.lines.length });
   }
 
+  // Already laid out like this (e.g. a document just opened): leave the DOM
+  // alone, or the browser lays every page out again for nothing.
+  const planned = new Map<Paragraph, { line: number; page: number }[]>();
+  pages.forEach((pieces, page) => {
+    for (const piece of pieces) {
+      if (!planned.has(piece.para)) planned.set(piece.para, []);
+      planned.get(piece.para)!.push({ line: piece.from, page });
+    }
+  });
+  const same = pages.length <= run.length && measured.every((para) => {
+    const now = planned.get(para) ?? [];
+    return now.length === para.placed.length && now.every((x, i) => x.line === para.placed[i].line && x.page === para.placed[i].page);
+  });
+  if (same) return { pages, cuts: new Map(), same };
+
+  const cuts = new Map<Paragraph, Map<number, LineStart>>();
+  for (const piece of pages.flat()) {
+    if (piece.from === 0) continue;
+    const start = piece.para.lines[piece.from].start?.();
+    if (!start) continue;
+    if (!cuts.has(piece.para)) cuts.set(piece.para, new Map());
+    cuts.get(piece.para)!.set(piece.from, start);
+  }
+  return { pages, cuts, same };
+}
+
+/**
+ * Re-break a run of continuing pages as planned. Returns the HTML of pages to
+ * add after the run's last page, and the run pages left empty.
+ */
+function repaginate(run: Link[], measured: Paragraph[], { pages, cuts }: PagePlan): { extra: string[]; emptied: Link[] } {
   // Build the blocks: join each paragraph's parts, then cut it at its breaks,
   // from the last cut back so earlier positions stay valid.
   const chunkAt = new Map<Paragraph, Map<number, HTMLElement>>();
   for (const para of measured) {
-    const cuts = pages.flat().filter((piece) => piece.para === para && piece.from > 0).map((piece) => piece.from);
     for (const part of para.parts) {
       if (isEmptyBlock(para.head)) para.head.replaceChildren();
       while (part.firstChild) para.head.appendChild(part.firstChild);
       part.remove();
     }
     const chunks = new Map<number, HTMLElement>([[0, para.head]]);
-    for (const cut of cuts.sort((a, b) => b - a)) {
-      const start = para.lines[cut].start;
-      if (start?.node.isConnected && para.head.contains(start.node)) chunks.set(cut, rawSplit(para.head, start.node, start.offset));
+    const paraCuts = cuts.get(para);
+    for (const cut of [...(paraCuts?.keys() ?? [])].sort((a, b) => b - a)) {
+      const start = paraCuts!.get(cut)!;
+      if (start.node.isConnected && para.head.contains(start.node)) chunks.set(cut, rawSplit(para.head, start.node, start.offset));
     }
     chunkAt.set(para, chunks);
   }
@@ -665,7 +733,7 @@ let pendingCaret: SavedCaret | null = null;
 let applying = false;
 
 function frameText(el: HTMLElement): string {
-  return el.isConnected ? el.innerText : blocks(el).map((b) => b.textContent ?? "").join("\n");
+  return shownInPage(el) ? el.innerText : plainText(el);
 }
 
 function htmlText(html: string): string {
@@ -680,7 +748,10 @@ function htmlText(html: string): string {
  * Returns the range of pages it added (which then need a pass of their own).
  */
 async function flowPass(start: number, end: number): Promise<{ start: number; end: number } | null> {
-  if (useUi.getState().viewMode !== "edit") return null;
+  if (useUi.getState().viewMode !== "edit") {
+    abandoned = true; // flowed when the editor is back (see usePageFlow)
+    return null;
+  }
   const pages = useDoc.getState().pages;
   const whole = buildChain(pages);
   const first = whole.findIndex((l) => l.pageIndex >= start);
@@ -691,10 +762,20 @@ async function flowPass(start: number, end: number): Promise<{ start: number; en
     await Promise.all([...new Set(chain.map((l) => l.frame.fontKey))].map((k) => ensureFontFace(k).catch(() => {})));
     await document.fonts.ready;
   } catch {
+    abandoned = true;
     return null;
   }
-  // The document may have changed while fonts loaded; a later pass handles it.
-  if (useDoc.getState().pages !== pages) return null;
+  // Print preview may have opened while fonts loaded: flow when the editor is back.
+  if (useUi.getState().viewMode !== "edit") {
+    abandoned = true;
+    return null;
+  }
+  // The document may have changed while fonts loaded: flow this range again
+  // with the new pages (a change that touched no page frame queues nothing).
+  if (useDoc.getState().pages !== pages) {
+    request = request ? { start: Math.min(request.start, start), end: Math.max(request.end, end) } : { start, end };
+    return null;
+  }
 
   const before = chain.map((l) => l.el.innerHTML);
   const wasEmpty = chain.map((l) => isEmpty(l.el));
@@ -736,9 +817,13 @@ async function flowPass(start: number, end: number): Promise<{ start: number; en
       if (i > 0 && continues(chain[i - 1], link)) runs[runs.length - 1].push(link);
       else runs.push([link]);
     });
-    const measures = runs.map(measureRun); // every read before any change
+    // Every read (measuring, and finding where the breaks fall in the text)
+    // before any change.
+    const measures = runs.map(measureRun);
+    const plans = runs.map((run, r) => planPages(run, measures[r]));
     runs.forEach((run, r) => {
-      const { extra } = repaginate(run, measures[r]);
+      if (plans[r].same) return;
+      const { extra } = repaginate(run, measures[r].paras, plans[r]);
       const afterPageId = run[run.length - 1].page.id;
       for (const html of extra) repaged.push({ afterPageId, html, text: htmlText(html) });
     });
@@ -822,6 +907,11 @@ async function flowPass(start: number, end: number): Promise<{ start: number; en
 
 let request: { start: number; end: number } | null = null;
 let running = false;
+/** The pages as the last finished passes left them, all flowed: entering the
+ *  editor again with these same pages has nothing to flow. */
+let settled: Page[] | null = null;
+/** A pass gave up without flowing (e.g. print preview was showing). */
+let abandoned = false;
 /** Wait until this time (ms) before the next pass, so a burst of clicks flows once. */
 let notBefore = 0;
 
@@ -839,6 +929,7 @@ export function requestFlow(start: number, end = start, delay = 0) {
   notBefore = Math.max(notBefore, Date.now() + delay);
   if (running) return;
   running = true;
+  abandoned = false;
   void (async () => {
     try {
       while (request) {
@@ -855,6 +946,7 @@ export function requestFlow(start: number, end = start, delay = 0) {
           if (restoreCaret(pendingCaret)) pendingCaret = null;
         }
       }
+      settled = abandoned ? null : useDoc.getState().pages;
     } finally {
       running = false;
     }
@@ -1036,8 +1128,13 @@ export function usePageFlow() {
       // Typing on a page flows at once; a change across pages waits for a pause.
       if (range) requestFlow(range.start, range.end, range.end > range.start ? 200 : 0);
     });
+    // Flow is off while print preview shows. Coming back flows the document
+    // only if it changed since it was last flowed: flowing it measures every
+    // page, which takes seconds on a long Nastaliq document.
     const unsubscribeUi = useUi.subscribe((state, previous) => {
-      if (state.viewMode === "edit" && previous.viewMode !== "edit") requestFlow(0, useDoc.getState().pages.length - 1);
+      if (state.viewMode !== "edit" || previous.viewMode === "edit") return;
+      const { pages } = useDoc.getState();
+      if (pages !== settled || running) requestFlow(0, pages.length - 1);
     });
     document.addEventListener("keydown", onKeyDown, true);
     return () => {
